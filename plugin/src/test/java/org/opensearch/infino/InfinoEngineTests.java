@@ -14,6 +14,7 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.ReaderManager;
 import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.store.Directory;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.seqno.ReplicationTracker;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -30,10 +31,12 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.LongConsumer;
 
 import static org.mockito.Mockito.mock;
@@ -41,6 +44,16 @@ import static org.mockito.Mockito.when;
 
 /** What a skeleton reader covers is known before a search can use it, and refreshes no search sees do not push it out. */
 public class InfinoEngineTests extends OpenSearchTestCase {
+    /** The ids a batch holds before it commits, as the engine reads it. */
+    private static final int BATCH_DOCS = Integer.getInteger("infino.engine.batch.docs", 50_000);
+    /** The source bytes a batch holds before it commits, as the engine reads it. */
+    private static final long BATCH_BYTES = Long.getLong("infino.engine.batch.bytes", 64L << 20);
+    /** The batches' worth of writes past which a client's write is refused. */
+    private static final int PENDING_BATCHES = 4;
+    /** The writes past which a client's write is refused, and a replay whose commits stall is held. */
+    private static final long BOUND = (long) PENDING_BATCHES * BATCH_DOCS;
+    /** Commits the hosted service leaves unanswered before it is back, in the replay tests. */
+    private static final int UNANSWERED_COMMITS = 5;
 
     /**
      * The external reader manager as the engine's: it refreshes the internal
@@ -262,12 +275,14 @@ public class InfinoEngineTests extends OpenSearchTestCase {
 
             assertEquals(1, appends.get());
             assertEquals("every write comes back to retry after a " + status, Set.copyOf(ids), first.retry().entries.keySet());
+            assertNotNull("the commit says the service did not answer, so a replay waits", first.unavailable());
 
             InfinoEngine.Batch open = new InfinoEngine.Batch();
             open.putBack(first.retry()); // as the commit puts back what it did not take
             InfinoEngine.Written second = InfinoEngine.write("t", 1, open, held -> {}, () -> {}, (id, v) -> null);
 
             assertTrue("the next commit takes every write", second.retry().isEmpty());
+            assertNull(second.unavailable());
             assertEquals(2, appends.get());
             assertEquals("the retried rows replace the ones the first append landed", Set.copyOf(ids), replacedByAppend.get(1));
         } finally {
@@ -538,5 +553,559 @@ public class InfinoEngineTests extends OpenSearchTestCase {
         m.write(0, bytes, 0, bytes.length);
         m.setByte(bytes.length, (byte) 0);
         return m;
+    }
+
+    /**
+     * While commits take nothing, a full batch waits before it commits
+     * again: a second, doubling, and never more than thirty seconds.
+     */
+    public void testAFullBatchWaitsLongerAfterEachStalledCommit() {
+        long second = TimeUnit.SECONDS.toNanos(1);
+        assertEquals(second, InfinoEngine.stallBackoffNanos(1));
+        assertEquals(2 * second, InfinoEngine.stallBackoffNanos(2));
+        assertEquals(16 * second, InfinoEngine.stallBackoffNanos(5));
+        assertEquals(30 * second, InfinoEngine.stallBackoffNanos(6));
+        assertEquals(30 * second, InfinoEngine.stallBackoffNanos(1_000));
+        assertEquals(second, InfinoEngine.stallBackoffNanos(0));
+    }
+
+    /** A replay is held at the bound a client's write is refused at: four batches' worth, in writes or in bytes. */
+    public void testTheReplayBoundIsTheOneAClientWriteIsRefusedAt() {
+        assertFalse(InfinoEngine.pastBound(BOUND - 1, 0));
+        assertTrue(InfinoEngine.pastBound(BOUND, 0));
+        assertFalse(InfinoEngine.pastBound(1, PENDING_BATCHES * BATCH_BYTES - 1));
+        assertTrue(InfinoEngine.pastBound(1, PENDING_BATCHES * BATCH_BYTES));
+    }
+
+    /**
+     * A commit the table took none of is a stall counted by id, not by write:
+     * the table puts back one write of each id it did not take, so a batch
+     * that holds two writes of an id and is refused whole is a stall. A
+     * commit whose deletes landed took something.
+     */
+    public void testAStallIsCountedByIdSoAnIdWrittenTwiceStillStalls() {
+        InfinoEngine.Batch sent = new InfinoEngine.Batch();
+        sent.add("a", InfinoEngine.Base.ABSENT, write(1, "{\"v\":1}"));
+        sent.add("a", InfinoEngine.Base.ABSENT, write(2, "{\"v\":2}"));
+        sent.add("b", InfinoEngine.Base.ABSENT, write(3, "{\"v\":3}"));
+        InfinoEngine.Batch retry = new InfinoEngine.Batch();
+        retry.add("a", InfinoEngine.Base.UNKNOWN, write(2, "{\"v\":2}"));
+        retry.add("b", InfinoEngine.Base.UNKNOWN, write(3, "{\"v\":3}"));
+        assertTrue("three writes of two ids, both put back", InfinoEngine.tookNone(sent, retry));
+
+        InfinoEngine.Batch tookOne = new InfinoEngine.Batch();
+        tookOne.add("a", InfinoEngine.Base.UNKNOWN, write(2, "{\"v\":2}"));
+        assertFalse(InfinoEngine.tookNone(sent, tookOne));
+        assertFalse(InfinoEngine.tookNone(sent, new InfinoEngine.Batch()));
+
+        InfinoEngine.Batch withDelete = new InfinoEngine.Batch();
+        withDelete.add("a", InfinoEngine.Base.ABSENT, write(1, "{\"v\":1}"));
+        withDelete.add("a", InfinoEngine.Base.ABSENT, write(2, "{\"v\":2}"));
+        withDelete.add("d", InfinoEngine.Base.PRESENT, write(3, null));
+        InfinoEngine.Batch writesBack = new InfinoEngine.Batch();
+        writesBack.add("a", InfinoEngine.Base.UNKNOWN, write(2, "{\"v\":2}"));
+        assertFalse("the delete landed", InfinoEngine.tookNone(withDelete, writesBack));
+    }
+
+    /**
+     * A take capped at a number of ids carries the oldest writes, by
+     * operation and not by the order each id was first written, and leaves
+     * only newer ones: the batch's lowest operation after it, where the
+     * table's hold on the history moves to, is past every write it took.
+     */
+    public void testATakeCappedAtItsIdsCarriesTheOldestWrites() {
+        InfinoEngine.Batch batch = new InfinoEngine.Batch();
+        batch.add("a", InfinoEngine.Base.ABSENT, write(1, "{}"));
+        batch.add("b", InfinoEngine.Base.ABSENT, write(2, "{}"));
+        batch.add("c", InfinoEngine.Base.ABSENT, write(3, "{}"));
+        batch.add("a", InfinoEngine.Base.ABSENT, write(9, "{}"));
+        batch.add("d", InfinoEngine.Base.ABSENT, write(4, "{}"));
+
+        InfinoEngine.Batch first = batch.take(Long.MAX_VALUE, 2, Long.MAX_VALUE);
+        assertEquals(List.of("a", "b"), List.copyOf(first.entries.keySet()));
+        assertEquals("a's newer write stays", 1, first.entries.get("a").versions.size());
+        assertEquals(2L, highestSeq(first));
+        assertEquals(3L, batch.lowestSeq());
+        assertEquals(InfinoEngine.Base.PRESENT, batch.entries.get("a").base);
+
+        InfinoEngine.Batch second = batch.take(Long.MAX_VALUE, 2, Long.MAX_VALUE);
+        assertEquals(List.of("c", "d"), List.copyOf(second.entries.keySet()));
+        assertEquals(9L, batch.lowestSeq());
+
+        InfinoEngine.Batch last = batch.take(Long.MAX_VALUE, 2, Long.MAX_VALUE);
+        assertEquals(List.of("a"), List.copyOf(last.entries.keySet()));
+        assertTrue(batch.isEmpty());
+    }
+
+    /** An id's writes in one take go together, oldest first, and count once against the cap. */
+    public void testATakeCountsAnIdWrittenSeveralTimesOnce() {
+        InfinoEngine.Batch batch = new InfinoEngine.Batch();
+        batch.add("a", InfinoEngine.Base.ABSENT, write(1, "{}"));
+        batch.add("a", InfinoEngine.Base.ABSENT, write(2, "{}"));
+        batch.add("a", InfinoEngine.Base.ABSENT, write(3, null));
+        batch.add("b", InfinoEngine.Base.ABSENT, write(4, "{}"));
+        batch.add("c", InfinoEngine.Base.ABSENT, write(5, "{}"));
+
+        InfinoEngine.Batch taken = batch.take(Long.MAX_VALUE, 2, Long.MAX_VALUE);
+        assertEquals(List.of("a", "b"), List.copyOf(taken.entries.keySet()));
+        assertEquals(List.of(1L, 2L, 3L), taken.entries.get("a").versions.stream().map(InfinoEngine.Version::seq).toList());
+        assertEquals(4, taken.size());
+        assertEquals(List.of("c"), List.copyOf(batch.entries.keySet()));
+        assertEquals(1, batch.size());
+    }
+
+    /**
+     * A take leaves an id's writes past {@code through}, and the writes of the
+     * id it left stand on what the taken ones leave in the table; the cap
+     * counts only what a commit through it carries.
+     */
+    public void testATakeLeavesAnIdsWritesPastThrough() {
+        InfinoEngine.Batch batch = new InfinoEngine.Batch();
+        batch.add("a", InfinoEngine.Base.ABSENT, gated(3, null));
+        batch.add("a", InfinoEngine.Base.ABSENT, gated(8, "{}"));
+        batch.add("b", InfinoEngine.Base.ABSENT, gated(4, "{}"));
+        batch.add("c", InfinoEngine.Base.ABSENT, gated(7, "{}"));
+
+        InfinoEngine.Batch taken = batch.take(5, 2, Long.MAX_VALUE);
+        assertEquals(List.of("a", "b"), List.copyOf(taken.entries.keySet()));
+        assertEquals(List.of(3L), taken.entries.get("a").versions.stream().map(InfinoEngine.Version::seq).toList());
+        assertEquals(List.of("a", "c"), List.copyOf(batch.entries.keySet()));
+        assertEquals("a delete was taken", InfinoEngine.Base.ABSENT, batch.entries.get("a").base);
+        assertFalse(batch.anyTakenBy(5));
+        assertTrue(batch.anyTakenBy(7));
+    }
+
+    /** A take stops once it carries about the bytes asked for, with one write at least. */
+    public void testATakeIsCappedAtItsBytes() {
+        InfinoEngine.Batch batch = new InfinoEngine.Batch();
+        batch.add("a", InfinoEngine.Base.ABSENT, write(1, "0123456789"));
+        batch.add("b", InfinoEngine.Base.ABSENT, write(2, "0123456789"));
+        batch.add("c", InfinoEngine.Base.ABSENT, write(3, "0123456789"));
+
+        assertEquals(List.of("a"), List.copyOf(batch.take(Long.MAX_VALUE, Integer.MAX_VALUE, 1).entries.keySet()));
+        InfinoEngine.Batch taken = batch.take(Long.MAX_VALUE, Integer.MAX_VALUE, 15);
+        assertEquals(List.of("b", "c"), List.copyOf(taken.entries.keySet()));
+        assertEquals(20L, taken.bytes);
+        assertTrue(batch.isEmpty());
+    }
+
+    /**
+     * A failure is the hosted service not answering when the bridge marks it
+     * so, whatever status it carries: a refused or broken connection and a
+     * request past its deadline as well as a 502, 503 or 504. Wrapped, too.
+     * A failure without the mark is not, a 503 included.
+     */
+    public void testAServiceIsUnansweredByTheBridgesMarkNotByStatus() {
+        for (RestStatus status : List.of(
+            RestStatus.INTERNAL_SERVER_ERROR,
+            RestStatus.BAD_GATEWAY,
+            RestStatus.SERVICE_UNAVAILABLE,
+            RestStatus.GATEWAY_TIMEOUT
+        )) {
+            assertTrue(status.name(), InfinoEngine.unanswered(new InfinoNative.InfinoException("no answer", status, true)));
+            assertFalse(status.name(), InfinoEngine.unanswered(new InfinoNative.InfinoException("refused", status)));
+        }
+        assertTrue(InfinoEngine.unanswered(new IllegalStateException("wrapped", new InfinoNative.InfinoException("x", RestStatus.SERVICE_UNAVAILABLE, true))));
+        assertTrue("a 429 for the account's request rate", InfinoEngine.unanswered(new InfinoNative.InfinoException("rate", RestStatus.TOO_MANY_REQUESTS)));
+        assertFalse(InfinoEngine.unanswered(new IllegalStateException("the bridge could not prepare a batch")));
+    }
+
+    /**
+     * A refused connection reaches the engine as the bridge reports it, an
+     * error marked {@code unavailable}: the commit keeps its batch and says
+     * the service did not answer, so a replay waits rather than stops. Any
+     * other failure of the append is thrown, and is no outage.
+     */
+    public void testARefusedConnectionIsAnUnansweredCommitNotARefusal() {
+        String refused = "{\"error\":\"the hosted service could not be reached or did not answer in time; try again later: "
+            + "append: transport error: Connection Failed: Connect error: Connection refused (os error 111)\",\"unavailable\":true,\"status\":503}";
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+            case "infino_open_with", "infino_prepare_batch_meta" -> new Memory(1);
+            case "infino_append_prepared" -> string(refused);
+            default -> null;
+        }));
+        try {
+            InfinoEngine.Batch batch = new InfinoEngine.Batch();
+            batch.add("a", InfinoEngine.Base.ABSENT, write(0, "{}"));
+            InfinoEngine.Written w = InfinoEngine.write("t", 1, batch, held -> {}, () -> {}, (id, v) -> null);
+            assertEquals(Set.of("a"), w.retry().entries.keySet());
+            assertTrue(w.unavailable(), w.unavailable().contains("Connection refused"));
+        } finally {
+            InfinoNative.useLib(null);
+        }
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+            case "infino_open_with", "infino_prepare_batch_meta" -> new Memory(1);
+            case "infino_append_prepared" -> string("{\"error\":\"append: server returned 413: too large\",\"status\":413}");
+            default -> null;
+        }));
+        try {
+            InfinoEngine.Batch batch = new InfinoEngine.Batch();
+            batch.add("a", InfinoEngine.Base.ABSENT, write(0, "{}"));
+            InfinoNative.InfinoException e = expectThrows(
+                InfinoNative.InfinoException.class,
+                () -> InfinoEngine.write("t", 1, batch, held -> {}, () -> {}, (id, v) -> null)
+            );
+            assertFalse(InfinoEngine.unanswered(e));
+        } finally {
+            InfinoNative.useLib(null);
+        }
+    }
+
+    /**
+     * The lookup ahead of a commit (a replay's writes, whose rows the table
+     * may hold already) is the first call a commit makes. When the hosted
+     * service does not answer it, the bridge marks the read
+     * {@code unavailable} as it marks a write, so the commit keeps its batch
+     * and says why rather than throwing: a recovery that throws there fails
+     * the shard. Nothing is prepared or appended.
+     */
+    public void testALookupTheServiceDidNotAnswerKeepsTheBatch() {
+        String refused = "{\"error\":\"the hosted service could not be reached or did not answer in time; try again later: "
+            + "query_sql: transport error: Connection Failed: Connect error: Connection refused (os error 111)\",\"unavailable\":true,\"status\":503}";
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+            case "infino_open_with" -> new Memory(1);
+            case "infino_sql_latest" -> string(refused);
+            case "infino_prepare_batch_meta", "infino_append_prepared" -> throw new AssertionError("a write after a lookup that was not answered");
+            default -> null;
+        }));
+        try {
+            InfinoEngine.Batch batch = new InfinoEngine.Batch();
+            batch.add("a", InfinoEngine.Base.UNKNOWN, write(0, "{}"));
+            batch.add("b", InfinoEngine.Base.UNKNOWN, write(1, "{}"));
+            InfinoEngine.Written w = InfinoEngine.write("t", 1, batch, held -> {}, () -> {}, (id, v) -> null);
+            assertEquals(Set.of("a", "b"), w.retry().entries.keySet());
+            assertTrue(w.unavailable(), w.unavailable().contains("Connection refused"));
+        } finally {
+            InfinoNative.useLib(null);
+        }
+    }
+
+    /**
+     * While commits stall, a full batch commits after each wait; past the
+     * bound it commits at once until the replay is held there.
+     */
+    public void testAFullBatchPastTheBoundCommitsAtOnceUntilTheReplayIsHeld() {
+        AtomicLong clock = new AtomicLong();
+        InfinoEngine.Stalls stalls = new InfinoEngine.Stalls(clock::get, clock::addAndGet);
+        assertTrue(stalls.fullBatchMayCommit(false));
+        stalls.noteStall(true, "no answer");
+        assertFalse(stalls.fullBatchMayCommit(false));
+        assertTrue("past the bound after one stall", stalls.fullBatchMayCommit(true));
+        stalls.noteStall(true, "no answer");
+        assertFalse("held from the second stall", stalls.fullBatchMayCommit(true));
+        clock.addAndGet(InfinoEngine.stallBackoffNanos(2));
+        assertTrue(stalls.fullBatchMayCommit(false));
+        stalls.noteProgress();
+        assertEquals(0, stalls.count());
+        assertTrue(stalls.fullBatchMayCommit(false));
+    }
+
+    /**
+     * A replay whose commits the hosted service does not answer waits at the
+     * bound, tries again after each wait, and once the service answers goes
+     * on to the end: the shard recovers by itself. Its writes never pass the
+     * bound by more than one operation.
+     */
+    public void testAReplayWaitsOutAServiceThatDoesNotAnswerAndGoesOn() {
+        FakeReplay replay = new FakeReplay(UNANSWERED_COMMITS, false);
+        long ops = 3 * BOUND;
+        replay.run(ops);
+        assertEquals(ops, replay.added);
+        assertEquals("every commit the service did not answer, then the one it took, then the rest", 0, replay.unansweredLeft);
+        assertTrue("it waited on its own thread", replay.parks > 0);
+        assertTrue("the backoff passed between tries", replay.clock.get() >= InfinoEngine.stallBackoffNanos(1));
+        assertTrue("held at the bound: " + replay.most, replay.most <= BOUND + 1);
+    }
+
+    /**
+     * The same when a commit throws a failure the bridge marks
+     * {@code unavailable}, whatever its status (a refused connection carries
+     * none of 502, 503 or 504): it is noted as unanswered, and the replay
+     * waits and goes on.
+     */
+    public void testAReplayWaitsWhenACommitFailsMarkedUnavailable() {
+        FakeReplay replay = new FakeReplay(UNANSWERED_COMMITS, false);
+        replay.throwsUnanswered = true;
+        long ops = 3 * BOUND;
+        replay.run(ops);
+        assertEquals(ops, replay.added);
+        assertEquals(0, replay.unansweredLeft);
+        assertTrue("it waited on its own thread", replay.parks > 0);
+        assertTrue("held at the bound: " + replay.most, replay.most <= BOUND + 1);
+    }
+
+    /**
+     * A document an append did not take tells the client to send it again
+     * when the hosted service turned it away for the rate (429) or could not
+     * serve it (502, 503, 504); a refusal of the document does not.
+     */
+    public void testADocumentTurnedAwayForNowHasARetryStatus() {
+        assertEquals(RestStatus.TOO_MANY_REQUESTS, InfinoEngine.retryStatus(failure(RATE_LIMITED, false)));
+        assertEquals(RestStatus.SERVICE_UNAVAILABLE, InfinoEngine.retryStatus(failure("append: server returned 504: gateway timeout", false)));
+        assertNull(InfinoEngine.retryStatus(failure("append: server returned 400: update error: bad value", false)));
+        assertNull("refused for what it carries", InfinoEngine.retryStatus(failure(RATE_LIMITED, true)));
+        assertNull(InfinoEngine.retryStatus(failure("the table refused it", false)));
+    }
+
+    /**
+     * A replay whose appends the hosted service turns away document by
+     * document for the account's request rate (every document a 429, none
+     * written) waits at the bound as it waits out an outage, and goes on once
+     * appends land, rather than stopping: the commit counts as one the
+     * service did not take ({@link InfinoEngine#noteCommit}), not as a table
+     * that refuses the writes.
+     */
+    public void testAReplayWhoseAppendsAre429PerDocumentWaitsAndGoesOn() {
+        AtomicInteger appends = new AtomicInteger();
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+            case "infino_open_with", "infino_prepare_batch_meta" -> new Memory(1);
+            case "infino_append_prepared" -> appends.incrementAndGet() <= UNANSWERED_COMMITS
+                ? string(
+                    "{\"ok\":0,\"failed\":[{\"b\":0,\"i\":0,\"reason\":\"" + RATE_LIMITED_JSON + "\",\"permanent\":false},"
+                        + "{\"b\":0,\"i\":1,\"reason\":\"" + RATE_LIMITED_JSON + "\",\"permanent\":false}]}"
+                )
+                : string("{\"ok\":2,\"failed\":[]}");
+            default -> null;
+        }));
+        try {
+            AtomicLong clock = new AtomicLong();
+            AtomicInteger parks = new AtomicInteger();
+            InfinoEngine.Stalls stalls = new InfinoEngine.Stalls(clock::get, nanos -> {
+                parks.incrementAndGet();
+                clock.addAndGet(nanos);
+            });
+            AtomicLong waiting = new AtomicLong();
+            InfinoEngine.Replay replay = new InfinoEngine.Replay() {
+                @Override
+                public String name() {
+                    return "replaying a test history";
+                }
+
+                @Override
+                public String backlog() {
+                    return InfinoEngine.pastBound(waiting.get(), 0) ? waiting.get() + " writes" : null;
+                }
+
+                @Override
+                public void commit() {
+                    // Two documents stand for the batch a commit carries.
+                    InfinoEngine.Batch sent = new InfinoEngine.Batch();
+                    sent.add("a", InfinoEngine.Base.ABSENT, write(0, "{}"));
+                    sent.add("b", InfinoEngine.Base.ABSENT, write(1, "{}"));
+                    InfinoEngine.Written w = InfinoEngine.write("t", 1, sent, held -> {}, () -> {}, (id, v) -> null);
+                    InfinoEngine.noteCommit(stalls, sent, w.retry(), w.unavailable());
+                    if (w.retry().isEmpty()) {
+                        waiting.addAndGet(-Math.min(waiting.get(), BATCH_DOCS));
+                    }
+                }
+
+                @Override
+                public boolean closing() {
+                    return false;
+                }
+            };
+            long most = 0;
+            for (long op = 0; op < 3 * BOUND; op++) {
+                most = Math.max(most, waiting.incrementAndGet());
+                stalls.hold(replay);
+                if (waiting.get() >= BATCH_DOCS && stalls.fullBatchMayCommit(InfinoEngine.pastBound(waiting.get(), 0))) {
+                    replay.commit();
+                }
+            }
+            assertTrue("every turned-away commit, then those that landed: " + appends.get(), appends.get() > UNANSWERED_COMMITS);
+            assertTrue("it waited on its own thread", parks.get() > 0);
+            assertTrue("held at the bound: " + most, most <= BOUND + 1);
+        } finally {
+            InfinoNative.useLib(null);
+        }
+    }
+
+    /** The reason a document turned away for the account's request rate carries. */
+    private static final String RATE_LIMITED = "append: server returned 429: {\"error\":\"rate limit exceeded\"}";
+    /** {@link #RATE_LIMITED} inside a JSON string. */
+    private static final String RATE_LIMITED_JSON = RATE_LIMITED.replace("\"", "\\\"");
+
+    /** A document an append did not take, with {@code reason}. */
+    private static InfinoNative.PreparedFailure failure(String reason, boolean permanent) {
+        return new InfinoNative.PreparedFailure(0, 0, reason, permanent, null, false);
+    }
+
+    /** A replay waiting for the hosted service stops once the engine closes. */
+    public void testAReplayWaitingForTheServiceStopsWhenTheEngineCloses() {
+        FakeReplay replay = new FakeReplay(Integer.MAX_VALUE, false);
+        replay.closeAfterParks = 3;
+        IllegalStateException e = expectThrows(IllegalStateException.class, () -> replay.run(3 * BOUND));
+        assertTrue(e.getMessage(), e.getMessage().contains("the engine is closing"));
+        assertEquals(3, replay.parks);
+        assertTrue(replay.most <= BOUND + 1);
+    }
+
+    /**
+     * A replay whose writes the table refuses stops at the bound with the
+     * table's reason, in the first backoff window too: it does not go on
+     * adding until a second commit after the wait.
+     */
+    public void testAReplayTheTableRefusesStopsAtTheBound() {
+        FakeReplay replay = new FakeReplay(0, true);
+        IllegalStateException e = expectThrows(IllegalStateException.class, () -> replay.run(3 * BOUND));
+        assertTrue(e.getMessage(), e.getMessage().contains("took none of its writes (the table refused them)"));
+        assertTrue("stopped at the bound: " + replay.most, replay.most <= BOUND + 1);
+        assertEquals("it never waited", 0, replay.parks);
+    }
+
+    /**
+     * The history a copy writes into the table on becoming primary is never
+     * held: a promotion writes it while every operation on the shard is
+     * blocked. Whether the hosted service does not answer or the table
+     * refuses the writes, the fill neither sleeps nor throws, goes through
+     * the whole history, and backs its commits off: once two have stalled
+     * (here the clock does not move), it commits no more, and the writes stay
+     * in the batch. A recovery held in the same state stops instead.
+     */
+    public void testAPromotionsFillNeitherWaitsNorFailsWhileTheTableTakesNothing() {
+        for (boolean refuses : new boolean[] { false, true }) {
+            AtomicLong clock = new AtomicLong();
+            InfinoEngine.Stalls stalls = new InfinoEngine.Stalls(clock::get, n -> fail("a fill slept"));
+            AtomicLong waiting = new AtomicLong();
+            AtomicLong commits = new AtomicLong();
+            List<RuntimeException> failures = new ArrayList<>();
+            BooleanSupplier commit = () -> {
+                commits.incrementAndGet();
+                if (refuses) {
+                    stalls.noteStall(false, "the table refused them");
+                    throw new IllegalStateException("the table refused them");
+                }
+                stalls.noteStall(true, "the hosted service did not answer");
+                return false;
+            };
+            long ops = 3 * BOUND;
+            for (long op = 0; op < ops; op++) {
+                if (waiting.incrementAndGet() % BATCH_DOCS == 0) {
+                    InfinoEngine.fillCommit(stalls, () -> InfinoEngine.pastBound(waiting.get(), 0), commit, failures::add);
+                }
+            }
+            InfinoEngine.fillCommit(stalls, () -> InfinoEngine.pastBound(waiting.get(), 0), commit, failures::add);
+            assertEquals("every operation of the history is written to the batch", ops, waiting.get());
+            assertEquals("backed off after two stalls", 2, commits.get());
+            assertEquals(refuses ? 2 : 0, failures.size());
+
+            FakeReplay recovery = new FakeReplay(0, true);
+            expectThrows(IllegalStateException.class, () -> recovery.run(3 * BOUND));
+        }
+    }
+
+    /** A fill commits as often as full batches ask while the table takes its commits. */
+    public void testAFillCommitsEachFullBatchWhileTheTableTakesThem() {
+        InfinoEngine.Stalls stalls = new InfinoEngine.Stalls(System::nanoTime, n -> fail("a fill slept"));
+        AtomicLong commits = new AtomicLong();
+        for (int i = 0; i < 5; i++) {
+            InfinoEngine.fillCommit(stalls, () -> false, () -> {
+                commits.incrementAndGet();
+                stalls.noteProgress();
+                return true;
+            }, e -> fail(e.getMessage()));
+        }
+        assertEquals(5, commits.get());
+    }
+
+    /** A write of operation {@code seq} that is not gated: a replay's; {@code source} null for a delete. */
+    private static InfinoEngine.Version write(long seq, String source) {
+        return new InfinoEngine.Version(seq, false, source, null, -1L, List.of());
+    }
+
+    /** A primary's write of operation {@code seq}, which waits for the copies to hold it. */
+    private static InfinoEngine.Version gated(long seq, String source) {
+        return new InfinoEngine.Version(seq, true, source, null, -1L, List.of());
+    }
+
+    private static long highestSeq(InfinoEngine.Batch batch) {
+        return batch.entries.values().stream().flatMap(e -> e.versions.stream()).mapToLong(InfinoEngine.Version::seq).max().orElseThrow();
+    }
+
+    /**
+     * A replay that adds one write per operation and commits as the engine's
+     * does: it is held after each write, and a full batch commits when the
+     * stalls let it. A commit carries one batch's worth. The hosted service
+     * leaves the first {@code unansweredLeft} commits unanswered; a table
+     * that {@code refuses} takes none of them. The clock moves only while it
+     * sleeps.
+     */
+    private static final class FakeReplay implements InfinoEngine.Replay {
+        final AtomicLong clock = new AtomicLong();
+        final InfinoEngine.Stalls stalls;
+        final boolean refuses;
+        boolean throwsUnanswered = false;
+        int unansweredLeft;
+        int closeAfterParks = Integer.MAX_VALUE;
+        int parks = 0;
+        long waiting = 0;
+        long added = 0;
+        long most = 0;
+
+        FakeReplay(int unanswered, boolean refuses) {
+            this.unansweredLeft = unanswered;
+            this.refuses = refuses;
+            this.stalls = new InfinoEngine.Stalls(clock::get, nanos -> {
+                parks++;
+                clock.addAndGet(nanos);
+            });
+        }
+
+        void run(long ops) {
+            for (long op = 0; op < ops; op++) {
+                waiting++;
+                added++;
+                most = Math.max(most, waiting);
+                stalls.hold(this);
+                if (waiting >= BATCH_DOCS && stalls.fullBatchMayCommit(InfinoEngine.pastBound(waiting, 0))) {
+                    try {
+                        commit();
+                    } catch (RuntimeException e) {
+                        // kept for the next commit, as the engine keeps its batch
+                    }
+                }
+            }
+        }
+
+        @Override
+        public String name() {
+            return "replaying a test history";
+        }
+
+        @Override
+        public String backlog() {
+            return InfinoEngine.pastBound(waiting, 0) ? waiting + " writes" : null;
+        }
+
+        @Override
+        public void commit() {
+            if (refuses) {
+                stalls.noteStall(false, "the table refused them");
+                return;
+            }
+            if (unansweredLeft > 0) {
+                unansweredLeft--;
+                if (throwsUnanswered) {
+                    // As the engine's commit notes a failure it throws: by the bridge's mark.
+                    InfinoNative.InfinoException e = new InfinoNative.InfinoException(
+                        "transport error: Connection refused",
+                        RestStatus.INTERNAL_SERVER_ERROR,
+                        true
+                    );
+                    stalls.noteStall(InfinoEngine.unanswered(e), e.getMessage());
+                    throw e;
+                }
+                // As the engine's commit does: the batch comes back, and the stall is noted as unanswered.
+                stalls.noteStall(true, "the hosted service did not answer: transport error: Connection refused");
+                return;
+            }
+            waiting -= Math.min(waiting, BATCH_DOCS);
+            stalls.noteProgress();
+        }
+
+        @Override
+        public boolean closing() {
+            return parks >= closeAfterParks;
+        }
     }
 }
