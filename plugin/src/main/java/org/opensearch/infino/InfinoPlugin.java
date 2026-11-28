@@ -131,8 +131,9 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     /**
      * Set by the registry on an index it recreates on a fresh cluster (see
      * {@link InfinoRegistry}): the index's table already holds rows, which
-     * a default-mode index's new Lucene skeleton knows nothing of, so its
-     * engine looks ids up in the table (see {@link InfinoEngine}).
+     * a default-mode index's new Lucene skeleton knows nothing of. Its
+     * primary starts empty over them, so its skeleton is rebuilt, as any
+     * such primary's is (see {@link InfinoEngine}).
      */
     public static final Setting<Boolean> INFINO_REBUILT = Setting.boolSetting(
         "index.infino.rebuilt",
@@ -555,10 +556,18 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         });
     }
 
-    /** Rebuild the skeleton of a primary of a default-mode index the registry recreated (see {@link InfinoSkeletonAdopter}). */
+    /**
+     * Rebuild the skeleton of a primary of a default-mode shard whose
+     * rebuild is under way: one that started empty over a table holding rows
+     * (an index the registry recreated, or a primary allocated empty), or
+     * one that holds the lease of a rebuild a copy before it began (a
+     * replica that took over, or a primary starting again from its store);
+     * or walk the table again for one whose rebuild left rows out (see
+     * {@link InfinoEngine#leavesRowsOut}); see {@link InfinoSkeletonAdopter}.
+     */
     private static void adoptIfRebuilt(IndexShard shard) {
         Settings settings = shard.indexSettings().getSettings();
-        if (!inDefaultMode(settings) || !INFINO_REBUILT.get(settings)) {
+        if (!inDefaultMode(settings) || !(InfinoEngine.rebuilding(shard.shardId()) || InfinoEngine.leavesRowsOut(shard.shardId()))) {
             return;
         }
         try {

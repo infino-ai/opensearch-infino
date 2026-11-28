@@ -984,10 +984,13 @@
         index: ep
 
 ---
-"Default mode: a write of an id its table holds twice leaves one row, of the write":
-  # An index named onto a table that outlived another holds rows its
-  # skeleton does not know: its first write of such an id adds a second row,
-  # as a write that landed twice leaves one (#151).
+"Default mode: a write of an id the table already holds replaces its row":
+  # An index named onto a table that outlived another holds rows its new
+  # skeleton does not know. Its primary rebuilds the skeleton from the table,
+  # and until that is done a write looks its id up in the table, so the first
+  # write of such an id replaces the row rather than adding a second one.
+  # (An id the table holds twice, as a write that landed twice leaves it, is
+  # repaired by the bridge, whose own tests cover it: no request reaches it.)
   - do:
       indices.create:
         index: dup_old
@@ -1006,10 +1009,12 @@
       index: { index: dup, id: x, refresh: true, body: { n: 2 } }
   - do:
       infino.sql:
-        body: { query: "SELECT count(*) AS c FROM dup WHERE osid = 'x'" }
-  - match: { rows.0.c: 2 }
+        body: { query: "SELECT count(*) AS c, min(n) AS lo, max(n) AS hi FROM dup WHERE osid = 'x'" }
+  - match: { rows.0.c: 1 }
+  - match: { rows.0.lo: 2 }
+  - match: { rows.0.hi: 2 }
 
-  # The next write replaces both rows with its one.
+  # The next write replaces that row with its own.
   - do:
       index: { index: dup, id: x, refresh: true, body: { n: 3 } }
   - do:

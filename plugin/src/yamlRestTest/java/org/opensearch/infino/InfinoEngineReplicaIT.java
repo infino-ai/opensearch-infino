@@ -34,6 +34,7 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
     private static final int LATER = 5;
     /** How long a copy may take to recover. */
     private static final String GREEN_TIMEOUT = "60s";
+    private static final long GREEN_WAIT_SECONDS = 60;
     /**
      * How long a node's reads may take to see another node's commit: well past
      * the table's read staleness window, which a run may widen to make a read
@@ -52,6 +53,13 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
      * the shard's global checkpoint does not move.
      */
     private static final String HELD = ",\"index.translog.durability\":\"async\",\"index.translog.sync_interval\":\"1h\"";
+    /** The table the rebuild test's indices name, and the value its write over a row the skeleton lacks sets. */
+    private static final String REBUILD_TABLE = "eng_rep_rebuild_rows";
+    private static final int REWRITTEN_VALUE = 999;
+    /** The cluster setting that holds skeleton rebuilds. */
+    private static final String PAUSED = "infino.skeleton_rebuild.paused";
+    /** The status a search that returns hits answers while its shard is rebuilt. */
+    private static final int UNAVAILABLE = 503;
     /** A date format of a field's own, which the table does not read without the mapper's values. */
     private static final String CUSTOM_DATE = "yyyy/MM/dd HH:mm:ss";
     /** Documents written with a date in {@link #CUSTOM_DATE}, a second apart. */
@@ -82,6 +90,84 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
         call("POST", "/" + index + "/_refresh", null);
         assertServesEvery(index, DOCS + LATER);
         call("DELETE", "/" + index, null);
+    }
+
+    /**
+     * A shard with a replica whose primary started empty over a table that
+     * holds rows, as an index the registry recreates does. While its rebuild
+     * is held, both copies refuse a search that returns hits (the replica
+     * knows of the rebuild from its lease, which every copy is given) and
+     * answer a count. When the primary is taken away mid-rebuild, the replica
+     * that takes over knows the rebuild is unfinished: a write of an id it
+     * has no document for replaces the table's row rather than adding a
+     * second one, the new replica refuses searches too, and once the rebuild
+     * is released the new primary finishes it, so both copies serve every
+     * row once, with refresh off.
+     */
+    @SuppressWarnings("unchecked")
+    public void testAReplicaAndATakenOverPrimaryKnowOfARebuildUnderWay() throws Exception {
+        String old = "eng_rep_rebuild_old";
+        String index = "eng_rep_rebuild";
+        String table = ",\"index.infino.table\":\"" + REBUILD_TABLE + "\"";
+        createIndex(old, 0, table);
+        write(old, 0, DOCS);
+        call("POST", "/" + old + "/_refresh", null);
+        call("DELETE", "/" + old, null);
+
+        call("PUT", "/_cluster/settings", "{\"persistent\":{\"" + PAUSED + "\":true}}");
+        try {
+            createIndex(index, 1, table);
+            assertGreen(index);
+            for (String preference : new String[] { "_primary", "_replica" }) {
+                assertRebuilding(index, preference);
+            }
+            assertBusy(() -> {
+                try {
+                    assertEquals(DOCS, countOn(index, "_replica"));
+                } catch (ResponseException e) {
+                    throw new AssertionError(e);
+                }
+            }, STALENESS_WAIT_SECONDS, TimeUnit.SECONDS);
+
+            cancelPrimary(index);
+            assertGreen(index);
+            // The skeleton has no document for d0, so the write reports it created,
+            // but it replaces the table's row: the count stays.
+            call("PUT", "/" + index + "/_doc/d0?refresh=true", "{\"n\":" + REWRITTEN_VALUE + "}");
+            assertEquals("the write replaces the row", DOCS, countOn(index, "_primary"));
+            for (String preference : new String[] { "_primary", "_replica" }) {
+                assertRebuilding(index, preference);
+            }
+        } finally {
+            call("PUT", "/_cluster/settings", "{\"persistent\":{\"" + PAUSED + "\":null}}");
+        }
+        assertBusy(() -> {
+            for (String preference : new String[] { "_primary", "_replica" }) {
+                try {
+                    assertEquals(preference, Set.copyOf(ids(0, DOCS)), hitIds(index, preference));
+                } catch (ResponseException e) {
+                    throw new AssertionError(e);
+                }
+            }
+        }, GREEN_WAIT_SECONDS, TimeUnit.SECONDS);
+        assertEquals(DOCS, count(index));
+        assertEquals(REWRITTEN_VALUE, ((Map<String, Object>) call("GET", "/" + index + "/_doc/d0", null).get("_source")).get("n"));
+        call("DELETE", "/" + index, null);
+    }
+
+    /** A search of {@code index} that returns hits, sent to the copy {@code preference} picks, answers 503: the shard is rebuilding. */
+    private void assertRebuilding(String index, String preference) {
+        ResponseException refused = expectThrows(
+            ResponseException.class,
+            () -> call("POST", "/" + index + "/_search?preference=" + preference, "{\"size\":" + (DOCS + 1) + "}")
+        );
+        assertEquals(preference, UNAVAILABLE, refused.getResponse().getStatusLine().getStatusCode());
+        assertTrue(refused.getMessage(), refused.getMessage().contains("rebuilding its documents"));
+    }
+
+    /** The count of {@code index}, from the copy {@code preference} picks. */
+    private int countOn(String index, String preference) throws IOException {
+        return ((Number) call("GET", "/" + index + "/_count?preference=" + preference, null).get("count")).intValue();
     }
 
     /**

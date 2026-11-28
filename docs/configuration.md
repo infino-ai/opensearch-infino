@@ -25,7 +25,7 @@ Come here when you want to:
 | `index.infino.optimize_interval` | `60s` | How often the table is compacted (5 seconds at least; off for a hosted account, which compacts its own tables). |
 | `index.infino.edges` | `false` | The index holds a graph's edges, for `graph_walk` and `graph_rank` in [SQL](../README.md#sql). Fixed at creation. |
 
-Two more index settings belong to the plugin, and no request sets them: `index.infino.rebuilt` marks an index a node recreated from the registry over a table that already held rows (see [Stateless nodes](../README.md#hosted-account-and-stateless-nodes)), and the private `index.infino.table_claimed` records whether the index was given its table when it was created (see the next paragraph).
+Two more index settings belong to the plugin, and no request sets them: `index.infino.rebuilt` marks an index a node recreated from the registry over a table that already held rows (see [Stateless nodes](../README.md#hosted-account-and-stateless-nodes)), whose documents are rebuilt from the table, as any primary's are that starts empty over a table holding rows (one allocated empty after its copies were lost, say); and the private `index.infino.table_claimed` records whether the index was given its table when it was created (see the next paragraph).
 
 A table backs one live index. If two indices name the same table (explicitly, or by names that map to one table, such as `logs.app` and `logs_app`), the older one is served from it and the other is refused, even after the older one is deleted. With the security plugin, setting `index.infino.table` in a create, resize, rollover or template request needs the right to manage the cluster.
 
@@ -43,7 +43,7 @@ A table backs one live index. If two indices name the same table (explicitly, or
 | `infino.cache.dir` | `infino-cache` under the node's first data path | Where the engine keeps a local copy of what it reads from the node's storage. Not used with a hosted account. |
 | `infino.sql.max_result_size` | `http.max_content_length` | The largest SQL result, as JSON; a statement whose result is larger is refused with a 400. |
 | `infino.storage.id` | set by the cluster | Persistent cluster setting (`PUT _cluster/settings`). The token of the storage the cluster's Infino indices live on, recorded from the data nodes' reports: the token more than half of them report, or, once all have reported, the one most report. A node whose storage has another token gets no Infino shards and answers 503 (see [Every node must see the same storage](../README.md#install-on-a-cluster)). Clear it when the cluster moved to other storage on purpose. |
-| `infino.skeleton_rebuild.paused` | `false` | Dynamic (`PUT _cluster/settings`). Holds the skeleton rebuild of an index recreated over a table that has rows, until it is cleared. Meanwhile the index's searches miss those rows, and writes look ids up in the table. |
+| `infino.skeleton_rebuild.paused` | `false` | Dynamic (`PUT _cluster/settings`). Holds the skeleton rebuild of an index recreated over a table that has rows, until it is cleared. Meanwhile a search of the index that returns hits answers 503 with a `Retry-After` header (a search over several shards fails whole), `_count`, `size: 0` searches and aggregations answer in full, and writes look ids up in the table. |
 
 ## JVM properties (`config/jvm.options` or `OPENSEARCH_JAVA_OPTS`)
 

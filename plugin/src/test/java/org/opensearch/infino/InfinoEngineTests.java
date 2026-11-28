@@ -286,10 +286,10 @@ public class InfinoEngineTests extends OpenSearchTestCase {
      */
     public void testARealtimeGetReadsTheLatestCommitUnlessTheLastCommitIsThisNodes() {
         String allocation = "alloc-1";
-        InfinoEngine.Copy primary = new InfinoEngine.Copy(true, allocation, false);
+        InfinoEngine.Copy primary = new InfinoEngine.Copy(true, allocation, false, false);
         assertFalse("no copy here", InfinoEngine.readsEveryCommit(null, false, a -> true));
         assertFalse("no engine here", InfinoEngine.readsEveryCommit("no_such_table"));
-        assertFalse("a replica", InfinoEngine.readsEveryCommit(new InfinoEngine.Copy(false, allocation, false), false, a -> true));
+        assertFalse("a replica", InfinoEngine.readsEveryCommit(new InfinoEngine.Copy(false, allocation, false, false), false, a -> true));
         assertFalse("a primary that has not committed since it took over", InfinoEngine.readsEveryCommit(primary, false, a -> false));
         assertFalse("a primary whose last commit was as another copy", InfinoEngine.readsEveryCommit(primary, false, "alloc-0"::equals));
         assertTrue("a primary that has committed as this copy", InfinoEngine.readsEveryCommit(primary, false, allocation::equals));
@@ -312,7 +312,7 @@ public class InfinoEngineTests extends OpenSearchTestCase {
         assertTrue(InfinoEngine.handedOff(tracker));
         assertTrue(
             "a relocated primary reads the latest commit",
-            InfinoEngine.readsEveryCommit(new InfinoEngine.Copy(true, "a", false), InfinoEngine.handedOff(tracker), "a"::equals) == false
+            InfinoEngine.readsEveryCommit(new InfinoEngine.Copy(true, "a", false, false), InfinoEngine.handedOff(tracker), "a"::equals) == false
         );
         assertFalse(InfinoEngine.handedOff(() -> 0L));
     }
