@@ -6,6 +6,7 @@ package org.opensearch.infino;
 
 import org.apache.lucene.analysis.standard.StandardTokenizer;
 import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.join.ScoreMode;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.OpenSearchSecurityException;
@@ -178,6 +179,10 @@ final class InfinoQueryTranslator {
      * every matching id before the outer query starts nor joins on them.
      */
     private static final String TEXT_PREDICATE = "text_match(";
+    /** {@link #groupKey} tag of clauses that are one term on one field each, read as one IN list. */
+    private static final String IN_GROUP = "in";
+    /** {@link #groupKey} tag of clauses that are a term on each of the same columns, read as one IN list of tuples. */
+    private static final String TUPLE_GROUP = "tuple";
     /** Predicate that keeps every row. */
     static final String ALL = "1=1";
     /** Predicate that keeps no row. */
@@ -1516,6 +1521,7 @@ final class InfinoQueryTranslator {
     }
 
     private String bool(BoolQueryBuilder b, boolean positive) {
+        refuseTooManyClauses(b);
         List<String> and = new ArrayList<>();
         for (QueryBuilder c : b.must()) {
             and.add(predicate(c, positive));
@@ -1535,7 +1541,13 @@ final class InfinoQueryTranslator {
         // minimum_should_match asks for some; otherwise it only affects scoring.
         boolean nothingRequired = b.must().isEmpty() && b.filter().isEmpty();
         int required = minimumShouldMatch(b.minimumShouldMatch(), b.should().size(), nothingRequired);
-        if (!b.should().isEmpty() && required > 0) {
+        if (!b.should().isEmpty() && required == 1) {
+            String any = anyOf(b.should());
+            if (any == null) {
+                return null;
+            }
+            and.add(any);
+        } else if (!b.should().isEmpty() && required > 0) {
             List<String> or = new ArrayList<>();
             for (QueryBuilder c : b.should()) {
                 String p = predicate(c, false);
@@ -1557,6 +1569,213 @@ final class InfinoQueryTranslator {
             return ALL;
         }
         return "(" + String.join(" AND ", and) + ")";
+    }
+
+    /**
+     * Refuses a bool with more clauses than one Lucene boolean query holds
+     * ({@code indices.query.bool.max_clause_count}), with the error stock
+     * gives when it builds the query. The limit is each bool's own, not the
+     * whole query's: stock serves a bool of many small bools. A bool of
+     * must_not clauses alone takes one more, the match_all stock adds for
+     * the documents to exclude from.
+     */
+    private static void refuseTooManyClauses(BoolQueryBuilder b) {
+        int positive = b.must().size() + b.filter().size() + b.should().size();
+        int clauses = positive + b.mustNot().size() + (positive == 0 && !b.mustNot().isEmpty() ? 1 : 0);
+        if (clauses > IndexSearcher.getMaxClauseCount()) {
+            IndexSearcher.TooManyClauses e = new IndexSearcher.TooManyClauses();
+            throw new QueryShardException((Index) null, "failed to create query: {}", e, e.getMessage());
+        }
+    }
+
+    /** One clause a should clause requires, with its predicate. */
+    private record Required(QueryBuilder clause, String predicate) {}
+
+    /**
+     * The rows at least one of {@code should} matches, or null when a clause
+     * has no predicate. The engine refuses a statement past a fixed count of
+     * AND / OR connectives, where stock limits each bool's own clauses (and
+     * the whole query's only once Lucene has rewritten it, dropping a term on
+     * a number outside a shard's values), so a few hundred small bools under
+     * one should (each a term on a node and a term on a file, say) would be
+     * refused here and served there. The disjunction is written short
+     * instead: each clause read as the clauses it requires
+     * ({@link #requires}), a clause every one requires is required once,
+     * clauses that are each one term on the same field are one IN list, and
+     * clauses that are each a term on the same few columns are one IN list
+     * of tuples ({@link #tupleIn}). Each step keeps the rows: AND and OR
+     * distribute over each other in SQL's three-valued logic too. When none
+     * applies, the clauses are joined by OR as written.
+     */
+    private String anyOf(List<QueryBuilder> should) {
+        List<String> whole = new ArrayList<>();
+        List<List<Required>> branches = new ArrayList<>();
+        for (QueryBuilder c : should) {
+            List<Required> branch = new ArrayList<>();
+            String p = requires(c, branch);
+            if (p == null) {
+                return null;
+            }
+            whole.add(p);
+            branch.removeIf(r -> ALL.equals(r.predicate()));
+            branches.add(branch);
+        }
+        String plain = "(" + String.join(" OR ", whole) + ")";
+        if (whole.size() < 2) {
+            return plain;
+        }
+        List<String> common = new ArrayList<>();
+        for (Required r : branches.get(0)) {
+            String p = r.predicate();
+            if (!common.contains(p) && branches.stream().allMatch(br -> br.stream().anyMatch(o -> o.predicate().equals(p)))) {
+                common.add(p);
+            }
+        }
+        // Each clause's own rest, grouped where one predicate can read a group.
+        Map<List<Object>, List<List<Required>>> groups = new LinkedHashMap<>();
+        for (int i = 0; i < branches.size(); i++) {
+            List<Required> rest = branches.get(i).stream().filter(r -> !common.contains(r.predicate())).toList();
+            if (rest.isEmpty()) {
+                // This clause holds wherever the common ones do.
+                return and(common);
+            }
+            groups.computeIfAbsent(groupKey(rest, i), k -> new ArrayList<>()).add(rest);
+        }
+        boolean merged = false;
+        List<String> or = new ArrayList<>();
+        for (Map.Entry<List<Object>, List<List<Required>>> g : groups.entrySet()) {
+            List<List<Required>> members = g.getValue();
+            if (members.size() > 1 && IN_GROUP.equals(g.getKey().get(0))) {
+                List<Object> values = new ArrayList<>();
+                for (List<Required> m : members) {
+                    QueryBuilder c = m.get(0).clause();
+                    values.addAll(c instanceof TermQueryBuilder t ? List.of(t.value()) : ((TermsQueryBuilder) c).values());
+                }
+                or.add(inList((String) g.getKey().get(1), values.stream().distinct().toList()));
+                merged = true;
+            } else if (members.size() > 1 && TUPLE_GROUP.equals(g.getKey().get(0))) {
+                or.add(tupleIn(members));
+                merged = true;
+            } else {
+                for (List<Required> m : members) {
+                    or.add(m.size() == 1 ? m.get(0).predicate() : "(" + String.join(" AND ", m.stream().map(Required::predicate).toList()) + ")");
+                }
+            }
+        }
+        if (common.isEmpty() && !merged) {
+            return plain;
+        }
+        List<String> parts = new ArrayList<>(common);
+        parts.add(or.size() == 1 ? or.get(0) : "(" + String.join(" OR ", or) + ")");
+        return and(parts);
+    }
+
+    /**
+     * Which group the rest of the {@code i}th should clause joins: one term
+     * (or terms) on a field, the field's IN group; a term on each of two or
+     * more columns, each compared as a plain {@code column = literal} (no
+     * list column, no address block, no case folding), the tuple group of
+     * those columns; anything else, a group of its own.
+     */
+    private List<Object> groupKey(List<Required> rest, int i) {
+        if (rest.size() == 1) {
+            QueryBuilder c = rest.get(0).clause();
+            String field = c instanceof TermQueryBuilder t && !t.caseInsensitive() ? t.fieldName()
+                : c instanceof TermsQueryBuilder ts && ts.termsLookup() == null ? ts.fieldName()
+                : null;
+            if (field != null && listable(field)) {
+                return List.of(IN_GROUP, field);
+            }
+            return List.of(i);
+        }
+        List<Object> key = new ArrayList<>(List.of(TUPLE_GROUP));
+        for (Required r : rest) {
+            Column c = plainEquality(r);
+            if (c == null || key.contains(c.name())) {
+                return List.of(i);
+            }
+            key.add(c.name());
+        }
+        // The same columns in any order are one group.
+        key.subList(1, key.size()).sort(null);
+        return key;
+    }
+
+    /** Whether a term on {@code field} reads as {@link #inList} reads it: not on a text column's terms, nor on an unmapped field. */
+    private boolean listable(String field) {
+        if ("_id".equals(field) || IGNORED_FIELD.equals(field)) {
+            return true;
+        }
+        Column c = column(field);
+        return c != null && !c.fts();
+    }
+
+    /** The column {@code r} compares as exactly {@code column = literal}, or null when it is any other clause. */
+    private Column plainEquality(Required r) {
+        if (!(r.clause() instanceof TermQueryBuilder t) || t.caseInsensitive() || t.value() == null || !listable(t.fieldName())) {
+            return null;
+        }
+        Column c = column(t.fieldName());
+        if (c == null) {
+            return null;
+        }
+        String lit = scalar(c.element(), t.value(), false);
+        return lit != null && r.predicate().equals(quoteIdent(c.name()) + " = " + lit) ? c : null;
+    }
+
+    /**
+     * Clauses that are each a term on the same columns ({@link #plainEquality}),
+     * as one IN list of tuples: {@code (a, b) IN ((1, 'x'), (2, 'y'))}, no
+     * connective however many. A row with a null in any of the columns
+     * matches none, as none of the equalities holds there.
+     */
+    private String tupleIn(List<List<Required>> members) {
+        List<String> names = new ArrayList<>();
+        for (Required r : members.get(0)) {
+            names.add(plainEquality(r).name());
+        }
+        names.sort(null);
+        List<String> rows = new ArrayList<>();
+        for (List<Required> m : members) {
+            String[] row = new String[names.size()];
+            for (Required r : m) {
+                Column c = plainEquality(r);
+                row[names.indexOf(c.name())] = scalar(c.element(), ((TermQueryBuilder) r.clause()).value(), false);
+            }
+            rows.add("(" + String.join(", ", row) + ")");
+        }
+        List<String> quoted = names.stream().map(InfinoQueryTranslator::quoteIdent).toList();
+        return "(" + String.join(", ", quoted) + ") IN (" + String.join(", ", rows.stream().distinct().toList()) + ")";
+    }
+
+    /**
+     * {@code qb}'s predicate as {@link #predicate} reads it under a should,
+     * with the clauses it requires added to {@code out}: a bool of must and
+     * filter clauses alone requires each of theirs, any other clause itself.
+     * Null when it has no predicate.
+     */
+    private String requires(QueryBuilder qb, List<Required> out) {
+        if (qb instanceof BoolQueryBuilder b && b.hasClauses() && b.should().isEmpty() && b.mustNot().isEmpty()) {
+            refuseTooManyClauses(b);
+            List<String> and = new ArrayList<>();
+            for (QueryBuilder c : b.must()) {
+                and.add(requires(c, out));
+            }
+            for (QueryBuilder c : b.filter()) {
+                filtering++;
+                try {
+                    and.add(requires(c, out));
+                } finally {
+                    filtering--;
+                }
+            }
+            return and.contains(null) ? null : "(" + String.join(" AND ", and) + ")";
+        }
+        String p = predicate(qb, false);
+        if (p != null) {
+            out.add(new Required(qb, p));
+        }
+        return p;
     }
 
     /**

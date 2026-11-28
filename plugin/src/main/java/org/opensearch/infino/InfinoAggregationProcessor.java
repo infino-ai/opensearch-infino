@@ -81,6 +81,8 @@ import org.opensearch.search.aggregations.bucket.terms.heuristic.SignificanceHeu
 import org.opensearch.search.aggregations.metrics.AvgAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.CardinalityAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.InternalAvg;
+import org.opensearch.search.aggregations.metrics.InternalHDRPercentileRanks;
+import org.opensearch.search.aggregations.metrics.InternalHDRPercentiles;
 import org.opensearch.search.aggregations.metrics.InternalMax;
 import org.opensearch.search.aggregations.metrics.InternalMin;
 import org.opensearch.search.aggregations.metrics.InternalSum;
@@ -123,6 +125,8 @@ import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
+
+import org.HdrHistogram.DoubleHistogram;
 
 import static org.opensearch.infino.InfinoQueryTranslator.literal;
 import static org.opensearch.infino.InfinoQueryTranslator.quoteIdent;
@@ -197,6 +201,12 @@ public class InfinoAggregationProcessor {
     private static final String DEFAULT_DATE_FORMAT = "strict_date_optional_time||epoch_millis";
     /** The t-digest compression OpenSearch uses when the request names none. */
     private static final double DEFAULT_TDIGEST_COMPRESSION = 100.0;
+    /** A percentiles metric's significant digits when it uses the t-digest method, not HDR. */
+    private static final int TDIGEST = -1;
+    /** Where a row carries an HDR metric's histogram of its bucket's values, after the metric's alias ({@link #readHistograms}). */
+    private static final String HISTOGRAM = "_hdr";
+    /** The least exponent of two a double holds (the smallest subnormal): an HDR bucket's width never goes below it. */
+    private static final int MIN_DOUBLE_EXPONENT = -1074;
     /** OpenSearch's page size for top hits when the request names none. */
     private static final int DEFAULT_TOP_HITS_SIZE = 3;
     /** Hits one top_hits may ask for per bucket; past this the rows belong in a search. */
@@ -518,6 +528,7 @@ public class InfinoAggregationProcessor {
             boolean counting = total == null;
             String select = (counting ? "COUNT(*) AS " + TOTAL_ALIAS + ", " : "") + metricColumns(rootMetrics);
             Map<String, Object> row = oneRow("SELECT " + select + " FROM " + relation + " WHERE " + where);
+            readHistograms(rootMetrics, List.of(row), List.of(), relation, where, List.of());
             if (counting) {
                 total = asLong(row.get(TOTAL_ALIAS));
             }
@@ -1113,12 +1124,14 @@ public class InfinoAggregationProcessor {
         final double[] percents;
         final boolean keyed;
         final double compression;
+        /** For percentiles and percentile ranks by the HDR method, its significant digits; {@link #TDIGEST} otherwise. */
+        final int digits;
         /** For a filter: where it holds, and the metrics under it. */
         final String predicate;
         final List<Metric> inner;
 
         private Metric(AggregationBuilder b, Source source, String alias, MetricKind kind, double[] percents, boolean keyed, double compression) {
-            this(b, source, alias, kind, percents, keyed, compression, null, List.of());
+            this(b, source, alias, kind, percents, keyed, compression, TDIGEST, null, List.of());
         }
 
         private Metric(
@@ -1129,6 +1142,7 @@ public class InfinoAggregationProcessor {
             double[] percents,
             boolean keyed,
             double compression,
+            int digits,
             String predicate,
             List<Metric> inner
         ) {
@@ -1139,6 +1153,7 @@ public class InfinoAggregationProcessor {
             this.percents = percents;
             this.keyed = keyed;
             this.compression = compression;
+            this.digits = digits;
             this.predicate = predicate;
             this.inner = inner;
         }
@@ -1182,7 +1197,7 @@ public class InfinoAggregationProcessor {
                         : of(sub, cols, table, subAlias, holds, now)
                 );
             }
-            return new Metric(f, null, alias, MetricKind.FILTER, null, false, 0, holds, inner);
+            return new Metric(f, null, alias, MetricKind.FILTER, null, false, 0, TDIGEST, holds, inner);
         }
 
         /**
@@ -1193,6 +1208,9 @@ public class InfinoAggregationProcessor {
         boolean foldable() {
             if (predicate != null && InfinoQueryTranslator.readsTextIndex(predicate)) {
                 return false;
+            }
+            if (hdr()) {
+                return false; // its histogram is a statement of its own over the filter's rows (see readHistograms)
             }
             for (Metric m : inner) {
                 if (!m.foldable()) {
@@ -1262,27 +1280,83 @@ public class InfinoAggregationProcessor {
             }
             if (b instanceof PercentileRanksAggregationBuilder pr) {
                 PercentilesConfig config = pr.percentilesConfig();
-                if (config != null && !(config instanceof PercentilesConfig.TDigest)) {
-                    throw new Unsupported("aggregation [" + b.getName() + "] uses the HDR method; only t-digest is served");
-                }
-                double compression = config instanceof PercentilesConfig.TDigest td ? td.getCompression() : DEFAULT_TDIGEST_COMPRESSION;
                 double[] values = pr.values();
                 if (values == null || values.length == 0) {
                     throw new Unsupported("aggregation [" + b.getName() + "] names no values");
                 }
-                return new Metric(b, c, alias, MetricKind.PERCENTILE_RANKS, values, pr.keyed(), compression);
+                return new Metric(b, c, alias, MetricKind.PERCENTILE_RANKS, values, pr.keyed(), compressionOf(config), digitsOf(config), null, List.of());
             }
             PercentilesAggregationBuilder p = (PercentilesAggregationBuilder) b;
             PercentilesConfig config = p.percentilesConfig();
-            if (config != null && !(config instanceof PercentilesConfig.TDigest)) {
-                throw new Unsupported("aggregation [" + b.getName() + "] uses the HDR method; only t-digest is served");
-            }
-            double compression = config instanceof PercentilesConfig.TDigest td ? td.getCompression() : DEFAULT_TDIGEST_COMPRESSION;
             double[] percents = p.percentiles();
             if (percents == null || percents.length == 0) {
                 throw new Unsupported("aggregation [" + b.getName() + "] names no percents");
             }
-            return new Metric(b, c, alias, MetricKind.PERCENTILES, percents, p.keyed(), compression);
+            return new Metric(b, c, alias, MetricKind.PERCENTILES, percents, p.keyed(), compressionOf(config), digitsOf(config), null, List.of());
+        }
+
+        /** A t-digest's compression, as the request names it or OpenSearch's default. */
+        private static double compressionOf(PercentilesConfig config) {
+            return config instanceof PercentilesConfig.TDigest td ? td.getCompression() : DEFAULT_TDIGEST_COMPRESSION;
+        }
+
+        /** The significant digits of the HDR method, or {@link #TDIGEST} for the t-digest one. */
+        private static int digitsOf(PercentilesConfig config) {
+            return config instanceof PercentilesConfig.Hdr hdr ? hdr.getNumberOfSignificantValueDigits() : TDIGEST;
+        }
+
+        /** Whether this is percentiles or percentile ranks by the HDR method, built from a histogram of its bucket's values. */
+        boolean hdr() {
+            return digits != TDIGEST;
+        }
+
+        /** The value an HDR metric records, as a double: a date as its epoch milliseconds, as stock reads a date's values. */
+        String hdrValue() {
+            return "CAST(" + Grouped.histNumber(source, "(" + source.expr() + ")") + " AS DOUBLE)";
+        }
+
+        /**
+         * The value an HDR metric records, cut to a value in the same bucket
+         * of stock's histogram, so the engine counts each bucket's values in
+         * a GROUP BY rather than shipping every value. The histogram buckets
+         * a positive value by its leading {@link #hdrBits} binary digits,
+         * whatever range it has adjusted to (its ranges differ by powers of
+         * two), so the value with every lower digit cleared lands where the
+         * value does. The digits kept are counted from the exponent
+         * {@code log2} gives, which can be one off at a power of two: one
+         * more digit is kept than the histogram reads, so a cut is never
+         * coarser than its bucket, only, at worst, finer. Zero and a negative
+         * value stay as they are: zero has a bucket of its own, and stock's
+         * histogram refuses a negative value, as this one then does.
+         */
+        String hdrBucket() {
+            String v = hdrValue();
+            String width = "power(CAST(2 AS DOUBLE), GREATEST(floor(log2(" + v + ")) - " + hdrBits() + ", " + MIN_DOUBLE_EXPONENT + "))";
+            return "CASE WHEN " + v + " > 0 THEN floor(" + v + " / " + width + ") * " + width + " ELSE " + v + " END";
+        }
+
+        /**
+         * The leading binary digits stock's histogram tells a value's bucket
+         * by: {@code log2} of its sub-bucket count, the least power of two
+         * holding {@code 2 * 10^digits} (at least 2), as the HdrHistogram
+         * library sizes it.
+         */
+        int hdrBits() {
+            long singleUnitResolution = 2 * (long) Math.pow(10, digits);
+            int bits = 64 - Long.numberOfLeadingZeros(singleUnitResolution - 1);
+            return Math.max(bits, 1);
+        }
+
+        /** An empty histogram as stock starts each bucket's: auto-resizing, at the request's significant digits. */
+        DoubleHistogram newHistogram() {
+            DoubleHistogram histogram = new DoubleHistogram(digits);
+            histogram.setAutoResize(true);
+            return histogram;
+        }
+
+        /** The histogram {@link #readHistograms} attached to {@code row}, or an empty one for a bucket with no value. */
+        private DoubleHistogram histogramOf(Map<String, Object> row) {
+            return row.get(alias + HISTOGRAM) instanceof DoubleHistogram h ? h : newHistogram();
         }
 
         /** The SELECT list entries for this metric. */
@@ -1306,6 +1380,10 @@ public class InfinoAggregationProcessor {
                 };
             }
             String f = "(" + source.expr() + ")";
+            if (hdr()) {
+                // Its histogram is read on its own (see readHistograms); the bucket's statement counts its values.
+                return "COUNT(" + f + ") AS " + alias + "_c";
+            }
             return switch (kind) {
                 case FILTER -> throw new IllegalStateException("a filter's columns are its count's and its metrics'");
                 case VALUE_COUNT -> "COUNT(" + f + ") AS " + alias + "_c";
@@ -1385,8 +1463,12 @@ public class InfinoAggregationProcessor {
                 case MIN -> new InternalMin(name, asDouble(row.get(alias + "_v"), Double.POSITIVE_INFINITY), DocValueFormat.RAW, meta);
                 case MAX -> new InternalMax(name, asDouble(row.get(alias + "_v"), Double.NEGATIVE_INFINITY), DocValueFormat.RAW, meta);
                 case CARDINALITY -> InfinoAggregationWire.cardinality(name, meta, asLong(row.get(alias + "_d")));
-                case PERCENTILES -> percentiles(row);
-                case PERCENTILE_RANKS -> percentileRanks(row);
+                case PERCENTILES -> hdr()
+                    ? new InternalHDRPercentiles(name, percents, histogramOf(row), keyed, DocValueFormat.RAW, meta)
+                    : percentiles(row);
+                case PERCENTILE_RANKS -> hdr()
+                    ? new InternalHDRPercentileRanks(name, percents, histogramOf(row), keyed, DocValueFormat.RAW, meta)
+                    : percentileRanks(row);
                 case FILTER -> {
                     List<InternalAggregation> subs = new ArrayList<>();
                     for (Metric m : inner) {
@@ -3102,6 +3184,66 @@ public class InfinoAggregationProcessor {
         return cols.isEmpty() ? "COUNT(*) AS n" : String.join(", ", cols);
     }
 
+    /**
+     * Attach to each of {@code rows} the histogram of each HDR metric of
+     * {@code metrics} over its bucket's values, as stock builds it: one
+     * statement per metric over {@code from WHERE where}, grouped by the
+     * buckets' keys ({@code keyCols}, {@code expression AS kN} in order, as
+     * the rows name them; none for one bucket) and by the metric's
+     * {@link Metric#hdrBucket}, so the engine sends a count per histogram
+     * bucket rather than every value. Each count goes into the bucket's
+     * histogram at a value in its histogram bucket, which leaves the
+     * histogram as recording each value would: the range it settles on
+     * follows from the least value alone, and a bucket's place from the
+     * value's leading binary digits. That is also why the histogram over
+     * several shards' rows read as one relation is the one stock's reduce
+     * merges from each shard's. A key over a field some document gives
+     * several values ({@code multi}) counts each document once per bucket
+     * ({@link #groupStatement}), as the bucket's own count does.
+     */
+    private static void readHistograms(
+        List<Metric> metrics,
+        List<Map<String, Object>> rows,
+        List<String> keyCols,
+        String from,
+        String where,
+        List<Source> multi
+    ) {
+        if (rows.isEmpty()) {
+            return;
+        }
+        int n = keyCols.size();
+        String bucket = "k" + n;
+        for (Metric m : metrics) {
+            if (!m.hdr()) {
+                continue;
+            }
+            List<String> cols = new ArrayList<>(keyCols);
+            cols.add(m.hdrBucket() + " AS " + bucket);
+            String sql = groupStatement(cols, "", from, "(" + where + ") AND " + m.hdrValue() + " IS NOT NULL", multi, "");
+            Map<String, DoubleHistogram> byKeys = new HashMap<>();
+            for (Map<String, Object> r : InfinoNative.sqlRows(sql)) {
+                byKeys.computeIfAbsent(keyString(keysOf(r, n)), k -> m.newHistogram())
+                    .recordValueWithCount(asDouble(r.get(bucket), Double.NaN), asLong(r.get("doc_count")));
+            }
+            for (Map<String, Object> row : rows) {
+                DoubleHistogram h = byKeys.get(keyString(keysOf(row, n)));
+                if (h != null) {
+                    row.put(m.alias + HISTOGRAM, h);
+                }
+            }
+        }
+    }
+
+    /** The first {@code n} keys of a grouped row, {@code k0} on. */
+    private static List<Object> keysOf(Map<String, Object> row, int n) {
+        List<Object> keys = new ArrayList<>(n);
+        for (int j = 0; j < n; j++) {
+            keys.add(row.get("k" + j));
+        }
+        return keys;
+    }
+
     private static Map<String, Object> oneRow(String sql) {
         List<Map<String, Object>> rows = InfinoNative.sqlRows(sql);
         return rows.isEmpty() ? Map.of() : rows.get(0);
@@ -3132,6 +3274,7 @@ public class InfinoAggregationProcessor {
             String w = "(" + where + ") AND (" + b.predicate() + ")";
             String select = "COUNT(*) AS doc_count" + (e.metrics.isEmpty() ? "" : ", " + metricColumns(e.metrics));
             Map<String, Object> row = oneRow("SELECT " + select + " FROM " + from + " WHERE " + w);
+            readHistograms(e.metrics, List.of(row), List.of(), from, w, List.of());
             long docCount = asLong(row.get("doc_count"));
             rows.add(row);
             topHits.add(bucketHits(e, from, w, docCount));
@@ -3284,6 +3427,7 @@ public class InfinoAggregationProcessor {
             Object k = c.key();
             long subsetDf = c.subsetDf();
             String w = "(" + where + ") AND " + key + " = " + Grouped.keyLiteral(s.keyKind, k);
+            readHistograms(s.metrics, List.of(c.row()), List.of(), from, w, List.of());
             topHits.add(bucketHits(s, from, w, subsetDf));
             nested.add(evalChildren(s.child, from, w, subsetDf));
         }
@@ -3504,6 +3648,7 @@ public class InfinoAggregationProcessor {
         for (Map<String, Object> row : rows) {
             long docCount = asLong(row.get("doc_count"));
             String bucket = "(" + where + ") AND " + bucketRestriction(c, row);
+            readHistograms(c.metrics, List.of(row), List.of(), from, bucket, List.of());
             topHits.add(bucketHits(c, from, bucket, docCount));
             nested.add(evalChildren(c.child, from, bucket, docCount));
         }
@@ -3774,6 +3919,10 @@ public class InfinoAggregationProcessor {
                 kept.add(tuple);
             }
             hitsByLevel.add(levelHits(chain, i, kept, from, where));
+            // The histograms of the level's HDR metrics, for its own buckets when
+            // they are few enough to name, else under the parents' it was read under.
+            String histogramsOf = kept.size() <= MAX_PARENT_TUPLES ? " AND " + tupleRestriction(chain, kept, i + 1, true) : restriction;
+            readHistograms(level.metrics, rows, levelKeyCols(chain, i), from, where + histogramsOf, levelMultiKeys(chain, i));
             if (rows.isEmpty()) {
                 break;
             }
@@ -4295,19 +4444,32 @@ public class InfinoAggregationProcessor {
      */
     private static String levelInner(List<Grouped> chain, int i, String from, String where, String restriction, boolean present) {
         Grouped level = chain.get(i);
-        List<String> keyCols = new ArrayList<>();
-        // The keys of this depth that read a field some document gives several values.
-        List<Source> multi = new ArrayList<>();
-        for (int j = 0; j <= i; j++) {
-            keyCols.add(chain.get(j).keyExpr + " AS k" + j);
-            if (chain.get(j).source.multi()) {
-                multi.add(chain.get(j).source);
-            }
-        }
+        List<String> keyCols = levelKeyCols(chain, i);
+        List<Source> multi = levelMultiKeys(chain, i);
         String metrics = level.metrics.isEmpty() ? "" : metricColumns(level.metrics);
         String keep = present ? " AND " + presence(level.keyExpr, level.source) : "";
         String having = level.minDocCount > 1 ? " HAVING COUNT(*) >= " + level.minDocCount : "";
         return groupStatement(keyCols, metrics, from, where + restriction + keep, multi, having);
+    }
+
+    /** The keys of level {@code i} of {@code chain} and every parent's, as its GROUP BY selects them: {@code expression AS kN}. */
+    private static List<String> levelKeyCols(List<Grouped> chain, int i) {
+        List<String> keyCols = new ArrayList<>();
+        for (int j = 0; j <= i; j++) {
+            keyCols.add(chain.get(j).keyExpr + " AS k" + j);
+        }
+        return keyCols;
+    }
+
+    /** The sources of those keys that read a field some document gives several values. */
+    private static List<Source> levelMultiKeys(List<Grouped> chain, int i) {
+        List<Source> multi = new ArrayList<>();
+        for (int j = 0; j <= i; j++) {
+            if (chain.get(j).source.multi()) {
+                multi.add(chain.get(j).source);
+            }
+        }
+        return multi;
     }
 
     /**
