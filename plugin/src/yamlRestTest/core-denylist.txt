@@ -59,7 +59,6 @@ bulk/40_source/Source filtering  # [bug] an update with _source filtering return
 
 # --- Search and get response fields
 search/190_index_prefix_search/search with index prefixes  # [bug] max_score differs from stock scoring (https://github.com/infino-ai/opensearch-infino/issues/212)
-search/50_multi_match/Cross fields do not return negative scores  # [bug] multi_match over several text fields is answered unranked: field boosts, tie_breaker and the cross_fields type are ignored, so hits come back in write order, not by score (https://github.com/infino-ai/opensearch-infino/issues/230)
 
 # --- Aggregation results
 search.aggregation/10_histogram/Deprecated _time order  # [bug] date_histogram ignores order: a descending key order comes back ascending (https://github.com/infino-ai/opensearch-infino/issues/205)
@@ -330,6 +329,7 @@ count/20_query_string/count with query_string parameters  # [gap] not served: qu
 search/60_query_string/search with query_string parameters  # [gap] not served: query_string with default_field, analyzer or lenient
 search/200_index_phrase_search/search with indexed phrases  # [gap] not served: a phrase with slop in query_string
 search/200_phrase_search_field_match_only_text/search with indexed phrases  # [gap] not served: a phrase with slop in query_string
+search/50_multi_match/Cross fields do not return negative scores  # [gap] not served: multi_match of type cross_fields over several text fields, which stock scores as one field (https://github.com/infino-ai/opensearch-infino/issues/230)
 search/380_bitmap_filtering/Terms query accepting bitmap as value  # [gap] not served: terms with a bitmap value, refused as a bad request
 search/381_bitmap_filtering_long/Terms query accepting bitmap as value (long)  # [gap] not served: terms with a bitmap value, refused as a bad request
 search/95_search_after_shard_doc/accept _shard_doc with PIT + paginate with search_after (multi-shard)  # [gap] not served: sort on _shard_doc

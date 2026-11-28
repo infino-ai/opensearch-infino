@@ -214,26 +214,58 @@ final class InfinoQueryTranslator {
     }
 
     /**
-     * A query string's BM25 over several text columns, as stock scores it:
-     * each of {@code clauses} scores the best of its columns' BM25 (a
+     * A query string's or a multi_match's BM25 over several text columns, as
+     * stock scores it: each of {@code clauses} scores the best of its
+     * columns' BM25, each times its column's weight in {@code weights} (a
      * {@code dis_max} with tie_breaker 0, one {@link TextClause} per column),
      * and a hit scores the sum over the clauses it matches (a bool's should
-     * clauses). {@code match} is the predicate the query string translated
-     * to, every row any clause matches; the ranked clauses read the same rows.
-     * {@code match} is null for a bool's match clauses beside a ranked
-     * principal, each on one column ({@link #summedClauses}): the
-     * translation's predicate and the principal's own keep the rows they
-     * match, and the clauses only score them.
+     * clauses). Under {@code mode} {@code or} a hit matches any clause and
+     * any of a clause's words; under {@code and}, one clause alone, all its
+     * words on one column. A column not in {@code weights} weighs 1.
+     * {@code match} is the predicate the query translated to, every row the
+     * clauses match; the ranked clauses read the same rows. {@code match} is
+     * null for a bool's match clauses beside a ranked principal, each on one
+     * column ({@link #summedClauses}): the translation's predicate and the
+     * principal's own keep the rows they match, and the clauses only score them.
      */
-    record Across(List<List<TextClause>> clauses, String match) {
-        /** The columns of a clause share its query, and every clause matches any of its words ({@code or}). */
+    record Across(List<List<TextClause>> clauses, String match, String mode, Map<String, Float> weights) {
+        /** The columns of a clause share its query, every clause reads {@code mode}, and {@code and} holds one clause. */
         Across {
+            if ("and".equals(mode) ? clauses.size() != 1 : !"or".equals(mode)) {
+                throw new IllegalArgumentException("ranked clauses under mode [" + mode + "]: " + clauses);
+            }
             for (List<TextClause> clause : clauses) {
                 for (TextClause c : clause) {
-                    if (!c.query().equals(clause.get(0).query()) || !"or".equals(c.mode())) {
+                    if (!c.query().equals(clause.get(0).query()) || !mode.equals(c.mode())) {
                         throw new IllegalArgumentException("a ranked clause's columns differ in query or mode: " + clause);
                     }
                 }
+            }
+            weights = Map.copyOf(weights);
+        }
+
+        /** Clauses that match any of their words, every column weighing 1. */
+        Across(List<List<TextClause>> clauses, String match) {
+            this(clauses, match, "or", Map.of());
+        }
+
+        /**
+         * The weights as {@code bm25_search_fields} reads them, a JSON object
+         * of column to factor, sorted by column name; null when every column weighs 1.
+         */
+        String weightsJson() {
+            if (weights.isEmpty()) {
+                return null;
+            }
+            try (XContentBuilder b = XContentFactory.jsonBuilder()) {
+                b.startObject();
+                for (Map.Entry<String, Float> w : new java.util.TreeMap<>(weights).entrySet()) {
+                    b.field(w.getKey(), w.getValue());
+                }
+                b.endObject();
+                return BytesReference.bytes(b).utf8ToString();
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
             }
         }
 
@@ -278,26 +310,39 @@ final class InfinoQueryTranslator {
      * {@code across} when a required query string over several text columns
      * is the one scoring clause, or when a ranked principal shares the score
      * with other match clauses: its hits rank by the sum of the clauses'
-     * BM25 ({@link Across}), beside {@code offset}.
+     * BM25 ({@link Across}), beside {@code offset}. {@code refused}, set on
+     * an unrankable scoring, is why: the one clause that would rank the hits
+     * is a multi_match whose score the table cannot give
+     * ({@link #unscorable}). A request that reads the hits by their score
+     * is refused with it; one that pages them in another order is served.
      */
-    record Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable, boolean zero, Across across) {
+    record Scoring(
+        TextClause text,
+        double offset,
+        List<Bonus> bonuses,
+        boolean ascending,
+        boolean unrankable,
+        boolean zero,
+        Across across,
+        String refused
+    ) {
         static final Scoring NONE = new Scoring(null, 0, List.of());
-        static final Scoring ZERO = new Scoring(null, 0, List.of(), false, false, true, null);
+        static final Scoring ZERO = new Scoring(null, 0, List.of(), false, false, true, null, null);
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses) {
-            this(text, offset, bonuses, false, false, false, null);
+            this(text, offset, bonuses, false, false, false, null, null);
         }
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending) {
-            this(text, offset, bonuses, ascending, false, false, null);
+            this(text, offset, bonuses, ascending, false, false, null, null);
         }
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable) {
-            this(text, offset, bonuses, ascending, unrankable, false, null);
+            this(text, offset, bonuses, ascending, unrankable, false, null, null);
         }
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable, boolean zero) {
-            this(text, offset, bonuses, ascending, unrankable, zero, null);
+            this(text, offset, bonuses, ascending, unrankable, zero, null, null);
         }
 
         /** Whether hits rank by more than the principal's BM25 alone: then {@code offset} only shifts every score alike. */
@@ -343,7 +388,7 @@ final class InfinoQueryTranslator {
             if (ranked() != null || scoring.text() != null || scoring.across() != null) {
                 return unscored();
             }
-            Scoring up = new Scoring(null, scoring.offset(), scoring.bonuses(), true, scoring.unrankable(), scoring.zero());
+            Scoring up = new Scoring(null, scoring.offset(), scoring.bonuses(), true, scoring.unrankable(), scoring.zero(), null, scoring.refused());
             return new Translation(table, where, principal, ranks, up, span);
         }
 
@@ -394,13 +439,23 @@ final class InfinoQueryTranslator {
         }
 
         /**
-         * The ranked relation for a query string across several text columns:
-         * the engine's {@code bm25_search_fields}, which scores each clause by
-         * its best column and sums the clauses a row matches, {@code k}
+         * The ranked relation for a query across several text columns: the
+         * engine's {@code bm25_search_fields}, which scores each clause by its
+         * best weighted column and sums the clauses a row matches, {@code k}
          * candidates.
          */
         String rankedFrom(Across across, int k) {
-            return "bm25_search_fields(" + literal(table) + ", " + literal(across.clausesJson()) + ", " + k + ", 'or')";
+            String weights = across.weightsJson();
+            return "bm25_search_fields("
+                + literal(table)
+                + ", "
+                + literal(across.clausesJson())
+                + ", "
+                + k
+                + ", "
+                + literal(across.mode())
+                + (weights == null ? "" : ", " + literal(weights))
+                + ")";
         }
 
         /**
@@ -458,6 +513,12 @@ final class InfinoQueryTranslator {
     private boolean filterTextIsPredicate;
     /** A required query string's ranking across its columns ({@link #across(QueryStringQueryBuilder)}), found while scoring. */
     private Across across;
+    /**
+     * The refusals of the required multi_match clauses that would rank the
+     * hits but whose score the table cannot give ({@link #unscorable}), found
+     * while scoring.
+     */
+    private final List<String> unscorable = new ArrayList<>();
     /** Each nested clause's matching documents with their scores, read once whether it filters, scores or both. */
     private final Map<NestedQueryBuilder, Map<String, Double>> nestedScores = new java.util.IdentityHashMap<>();
     /** Each BM25-scored term clause's score ({@link #bm25TermScore}), read once per clause. */
@@ -578,17 +639,28 @@ final class InfinoQueryTranslator {
         if (scoresNothing(root)) {
             return Scoring.ZERO;
         }
+        unscorable.clear();
         required(root, offset, bonuses, texts, summed, unscored, stray);
+        String refused = null;
+        if (!unscorable.isEmpty()) {
+            // Such a multi_match is refused only when it alone would rank the
+            // hits; beside another scoring clause the hits are unranked, as
+            // they are beside any clause the table cannot score.
+            if (unscorable.size() == 1 && across == null && !unscored[0] && texts.isEmpty() && bonuses.isEmpty()) {
+                refused = unscorable.get(0);
+            }
+            unscored[0] = true;
+        }
         TextClause ranked = principalRanks ? principal : null;
         Across clauses = ranked == null || across != null || stray[0] || !bonuses.isEmpty() ? null : summedClauses(summed);
         if (clauses != null) {
             // The principal's BM25 and every other match clause's, summed where each matches.
-            return new Scoring(null, offset[0], List.of(), false, false, false, clauses);
+            return new Scoring(null, offset[0], List.of(), false, false, false, clauses, null);
         }
         if (across != null) {
             if (principal == null && !unscored[0] && texts.isEmpty() && bonuses.isEmpty()) {
                 // The query string's BM25 across its columns is the only score beside the offset.
-                return new Scoring(null, offset[0], List.of(), false, false, false, across);
+                return new Scoring(null, offset[0], List.of(), false, false, false, across, null);
             }
             // Beside another scoring clause the sum is no longer the query string's alone.
             unscored[0] = true;
@@ -598,7 +670,7 @@ final class InfinoQueryTranslator {
             // which would add its BM25 beside the first) would leave some of the
             // hits it matches at 0, under hits it outscores in stock: with no
             // ranked clause, the hits keep the one score they all had.
-            return new Scoring(null, offset[0], List.of(), false, true);
+            return new Scoring(null, offset[0], List.of(), false, true, false, null, refused);
         }
         // Beside a ranked clause a should clause the table cannot score adds
         // nothing, as before; the others add theirs.
@@ -670,9 +742,14 @@ final class InfinoQueryTranslator {
                 stray[0] = true;
             }
             if (t == null || !principalRanks || !t.equals(principal)) {
-                // A query string over several columns ranks across them when it is the one text clause.
-                Across a = principal == null && across == null && qb instanceof QueryStringQueryBuilder qs ? across(qs) : null;
-                if (a != null) {
+                // A query string or a multi_match over several columns ranks across them when it is the one text clause.
+                boolean ranks = principal == null && across == null;
+                String why = ranks && qb instanceof MultiMatchQueryBuilder mm ? unscorable(mm) : null;
+                Across a = ranks && why == null ? across(qb) : null;
+                if (why != null) {
+                    // Whether it is the one clause ranking the hits is known once every clause is read (scoring).
+                    unscorable.add(why);
+                } else if (a != null) {
                     across = a;
                 } else {
                     unscored[0] = true;
@@ -720,6 +797,194 @@ final class InfinoQueryTranslator {
             && m.minimumShouldMatch() == null
             && m.fuzziness() == null
             && m.analyzer() == null;
+    }
+
+    /** How {@code qb} ranks across its text columns ({@link Across}): a query string's or a multi_match's, else null. */
+    private Across across(QueryBuilder qb) {
+        if (qb instanceof QueryStringQueryBuilder qs) {
+            return across(qs);
+        }
+        if (qb instanceof MultiMatchQueryBuilder mm) {
+            return across(mm);
+        }
+        return null;
+    }
+
+    /**
+     * How stock ranks {@code mm} across its text columns ({@link Across}), or
+     * null when the plugin does not rank it that way: it reaches one text
+     * column (then it is the principal), a field that is a pattern or no
+     * text column, or it sets an option that changes which words it reads.
+     *
+     * <p>Stock scores each field's match of the words, times the field's
+     * boost and the query's, and combines the fields as a {@code dis_max}
+     * with the query's tie_breaker ({@link #tieBreaker}): the best field's
+     * score plus tie_breaker times the others'. Tie_breaker 0 is one clause
+     * over every column, scored by the best; 1 is a clause per column,
+     * summed. Under operator and every field must match all the words, which
+     * one clause in mode {@code and} reads; a sum of such fields is past the
+     * engine's modes, and is left unranked. A phrase is one run of words, so
+     * the operator changes nothing for it, as in stock.
+     */
+    private Across across(MultiMatchQueryBuilder mm) {
+        MultiMatchQueryBuilder.Type type = mm.type();
+        if ((type != MultiMatchQueryBuilder.Type.BEST_FIELDS
+            && type != MultiMatchQueryBuilder.Type.MOST_FIELDS
+            && type != MultiMatchQueryBuilder.Type.PHRASE)
+            || mm.minimumShouldMatch() != null
+            || mm.analyzer() != null
+            || mm.slop() != 0
+            || mm.cutoffFrequency() != null) {
+            return null;
+        }
+        float tieBreaker = tieBreaker(mm);
+        boolean summed = tieBreaker == 1f;
+        boolean all = type != MultiMatchQueryBuilder.Type.PHRASE && mm.operator() == Operator.AND;
+        if ((!summed && tieBreaker != 0f) || (summed && all)) {
+            return null;
+        }
+        // The predicate the multi_match is; one that set a principal is ranked by it.
+        InfinoQueryTranslator alone = new InfinoQueryTranslator(cols, table, nowMillis, trusted, columnValuesOnly, rows);
+        String match;
+        try {
+            match = alone.predicate(mm, true);
+        } catch (IllegalArgumentException | OpenSearchSecurityException e) {
+            return null;
+        }
+        if (match == null || alone.principal != null || ALL.equals(match) || NONE.equals(match)) {
+            return null;
+        }
+        List<String> columns = new ArrayList<>();
+        Map<String, Float> weights = new LinkedHashMap<>();
+        try {
+            for (Map.Entry<String, Float> f : mm.fields().entrySet()) {
+                Column c = column(f.getKey());
+                if (c == null && f.getKey().indexOf('*') < 0) {
+                    continue; // stock's dis_max has no score from a field the mapping does not have
+                }
+                if (c == null || !c.fts() || columns.contains(c.name())) {
+                    return null; // a pattern, a column with no text index, or one reached twice
+                }
+                float weight = f.getValue() * mm.boost();
+                if (!Float.isFinite(weight) || weight <= 0) {
+                    return null;
+                }
+                columns.add(c.name());
+                if (weight != 1f) {
+                    weights.put(c.name(), weight);
+                }
+            }
+        } catch (IllegalArgumentException | OpenSearchSecurityException e) {
+            return null; // a field the table serves no column of, or one masked for the user
+        }
+        if (columns.size() < 2 || columns.size() > MAX_ACROSS_SEARCHES) {
+            return null;
+        }
+        String value = String.valueOf(mm.value());
+        String query = type == MultiMatchQueryBuilder.Type.PHRASE ? phrase(value) : plainTerms(value);
+        String mode = all ? "and" : "or";
+        List<TextClause> each = new ArrayList<>();
+        for (String c : columns) {
+            each.add(new TextClause(c, query, mode));
+        }
+        List<List<TextClause>> clauses = new ArrayList<>();
+        if (summed) {
+            for (TextClause c : each) {
+                clauses.add(List.of(c));
+            }
+        } else {
+            clauses.add(List.copyOf(each));
+        }
+        return new Across(List.copyOf(clauses), match, mode, weights);
+    }
+
+    /**
+     * The tie_breaker stock combines a multi_match's fields with: the one it
+     * names, else its type's (0 for best_fields and the phrase types, 1 for
+     * most_fields, the sum of the fields' scores).
+     */
+    private static float tieBreaker(MultiMatchQueryBuilder mm) {
+        return mm.tieBreaker() != null ? mm.tieBreaker() : mm.type().tieBreaker();
+    }
+
+    /**
+     * Why a scored multi_match over several text columns has a score the
+     * table cannot give, to refuse it rather than leave its hits unranked
+     * ({@link Scoring#refused}): cross_fields,
+     * which scores each word as if the fields were one, blending their term
+     * statistics, and a tie_breaker between 0 and 1, which adds that share
+     * of the other fields' scores to the best field's. The engine scores a
+     * clause by its best column or sums the columns, nothing between. Null
+     * when the table gives its score.
+     */
+    private String unscorable(MultiMatchQueryBuilder mm) {
+        if (textColumns(mm) < 2) {
+            return null;
+        }
+        if (mm.type() == MultiMatchQueryBuilder.Type.CROSS_FIELDS) {
+            return crossFieldsRefused(mm).getMessage();
+        }
+        float tieBreaker = tieBreaker(mm);
+        if (tieBreaker != 0f && tieBreaker != 1f) {
+            return "[infino] multi_match on ["
+                + String.join(", ", mm.fields().keySet())
+                + "] with tie_breaker ["
+                + tieBreaker
+                + "] is not served: the table scores several text fields by the best one (tie_breaker 0) or by their sum (tie_breaker 1)";
+        }
+        return null;
+    }
+
+    /** A cross_fields multi_match over several text fields, refused: the table scores and matches each field apart. */
+    private static IllegalArgumentException crossFieldsRefused(MultiMatchQueryBuilder mm) {
+        return new IllegalArgumentException(
+            "[infino] multi_match of type [cross_fields] on ["
+                + String.join(", ", mm.fields().keySet())
+                + "] is not served: the table matches and scores each text field apart, not as one field"
+        );
+    }
+
+    /** How many distinct text columns the fields of {@code mm} name, a pattern ({@code *}) naming every one it matches. */
+    private int textColumns(MultiMatchQueryBuilder mm) {
+        List<String> text = new ArrayList<>();
+        for (String f : mm.fields().keySet()) {
+            Column c = resolve(f);
+            if (c != null && c.fts() && !text.contains(c.name())) {
+                text.add(c.name());
+            } else if (c == null) {
+                for (String each : textColumnsMatching(f)) {
+                    if (!text.contains(each)) {
+                        text.add(each);
+                    }
+                }
+            }
+        }
+        return text.size();
+    }
+
+    /**
+     * The text columns a field pattern ({@code ti*}, {@code *}) names, each
+     * once: those whose field or alias it matches, as stock expands a
+     * pattern to the mapped fields. The id column is no field of the
+     * documents, and a field masked for the user is left out rather than
+     * matched by its clear values. Empty when {@code field} is no pattern.
+     */
+    private List<String> textColumnsMatching(String field) {
+        List<String> names = new ArrayList<>();
+        if (!org.opensearch.common.regex.Regex.isSimpleMatchPattern(field)) {
+            return names;
+        }
+        for (Map.Entry<String, Column> entry : cols.entrySet()) {
+            Column c = entry.getValue();
+            if (c.fts()
+                && !c.name().equals(OSID)
+                && (trusted || !c.masked())
+                && !names.contains(c.name())
+                && org.opensearch.common.regex.Regex.simpleMatch(field, fieldOf(entry.getKey()))) {
+                names.add(c.name());
+            }
+        }
+        return names;
     }
 
     /** How a query string's JSON names its default type, best_fields: the builder has no getter for it. */
@@ -1483,6 +1748,10 @@ final class InfinoQueryTranslator {
                 );
             }
             unfuzzy("multi_match", String.join(", ", mm.fields().keySet()), mm.fuzziness());
+            if (mm.type() == MultiMatchQueryBuilder.Type.CROSS_FIELDS && mm.operator() == Operator.AND && textColumns(mm) >= 2) {
+                // Stock needs each word in some field; each field matching all of them keeps fewer rows.
+                throw crossFieldsRefused(mm);
+            }
             boolean asPhrase = mm.type() == MultiMatchQueryBuilder.Type.PHRASE;
             return textOnFields(new ArrayList<>(mm.fields().keySet()), String.valueOf(mm.value()), mm.operator(), positive, asPhrase, true);
         }
@@ -2576,6 +2845,12 @@ final class InfinoQueryTranslator {
         for (String f : fields) {
             Column c = column(f);
             if (c == null) {
+                // A pattern searches the text fields it matches.
+                for (String each : textColumnsMatching(f)) {
+                    if (!indexed.contains(each)) {
+                        indexed.add(each);
+                    }
+                }
                 continue;
             }
             if (c.fts()) {
