@@ -988,7 +988,10 @@ final class InfinoScriptTranslator {
                 }
                 case "doc" -> {
                     if (c.name().equals("containsKey") && c.args().size() == 1) {
-                        return new Sql(column(constantString(c.args().get(0), scope)) != null ? "TRUE" : "FALSE", SqlType.BOOL);
+                        String key = constantString(c.args().get(0), scope);
+                        // _index has no column, but every document has it, as stock's doc map does.
+                        boolean held = InfinoIndexField.NAME.equals(key) || column(key) != null;
+                        return new Sql(held ? "TRUE" : "FALSE", SqlType.BOOL);
                     }
                     throw refuse("calls doc." + c.name() + ", which is not served");
                 }

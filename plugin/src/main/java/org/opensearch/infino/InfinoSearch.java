@@ -3068,8 +3068,10 @@ public final class InfinoSearch {
      * order {@code builders} names them. No other index holds a part of those
      * answers, so the reduce takes each as it is. {@code total} is the rows
      * they match, as each index counted its own. Refused as over default-mode
-     * shards: with a top_hits under it, or over an index read under a
-     * document, field or masking rule.
+     * shards: with a top_hits under it, over an index read under a field or
+     * masking rule, or with a significant_terms over an index read under a
+     * document rule (see {@link InfinoExactAggregation#refuseRestrictedOverSeveral}).
+     * A document rule otherwise holds in each index's plan.
      */
     private static InternalAggregations withOverAll(
         InternalAggregations first,

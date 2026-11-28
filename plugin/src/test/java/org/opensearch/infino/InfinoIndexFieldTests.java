@@ -172,6 +172,13 @@ public class InfinoIndexFieldTests extends OpenSearchTestCase {
         assertTrue(named, named.startsWith("(1=1 OR "));
     }
 
+    /** {@code doc.containsKey('_index')} is true, as every document has the field in stock's doc map. */
+    public void testAScriptAskingWhetherADocumentHasTheFieldIsTrue() {
+        String held = where(QueryBuilders.scriptQuery(new Script("doc.containsKey('_index')")));
+        assertEquals(where(QueryBuilders.scriptQuery(new Script("doc.containsKey('service')"))), held);
+        assertNotEquals(where(QueryBuilders.scriptQuery(new Script("doc.containsKey('nosuch')"))), held);
+    }
+
     /** A script reading {@code doc['_index']} is refused: no column holds it, and read as unmapped it would be null where stock reads the name. */
     public void testAScriptReadingTheFieldIsRefused() {
         IllegalArgumentException e = expectThrows(
