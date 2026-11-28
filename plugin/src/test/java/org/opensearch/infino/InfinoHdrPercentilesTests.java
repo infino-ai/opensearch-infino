@@ -15,6 +15,9 @@ import org.opensearch.search.aggregations.metrics.PercentilesConfig;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.math.BigDecimal;
+import java.math.MathContext;
+import java.math.RoundingMode;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -41,10 +44,20 @@ public class InfinoHdrPercentilesTests extends OpenSearchTestCase {
     private static final int MAX_DECADES = 12;
     /** The least decade a double field's values start at. */
     private static final int MIN_DOUBLE_DECADE = -3;
+    /** Powers of two the least value of the range-limit test is drawn from, either side of one. */
+    private static final int EDGE_EXPONENTS = 20;
+    /** Significant decimal digits the range-limit test writes its values with: few enough to read back exactly. */
+    private static final int EDGE_DIGITS = 15;
+    /** Powers of two past the least value that no histogram covers: where the search for the greatest value starts. */
+    private static final int BEYOND_ANY_RANGE = 80;
 
     @Override
     public void setUp() throws Exception {
         super.setUp();
+        resetTable();
+    }
+
+    private static void resetTable() {
         InfinoNative.dropTable(TABLE);
         InfinoNative.ensureTable(TABLE, "{\"properties\":{\"g\":{\"type\":\"keyword\"},\"l\":{\"type\":\"long\"},\"d\":{\"type\":\"double\"}}}");
     }
@@ -260,6 +273,139 @@ public class InfinoHdrPercentilesTests extends OpenSearchTestCase {
             ArrayIndexOutOfBoundsException.class,
             () -> run(AggregationBuilders.percentiles("p").field("l").percentiles(50).percentilesConfig(new PercentilesConfig.Hdr(5)))
         );
+    }
+
+    /** Whether one stock histogram takes {@code a} and {@code b}, recorded in either order. */
+    private static boolean stockTakes(double a, double b, int digits) {
+        for (double[] order : new double[][] { { a, b }, { b, a } }) {
+            DoubleHistogram h = new DoubleHistogram(digits);
+            h.setAutoResize(true);
+            try {
+                for (double v : order) {
+                    h.recordValue(v);
+                }
+            } catch (ArrayIndexOutOfBoundsException e) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The greatest double a stock histogram still takes beside {@code least}. */
+    private static double greatestBeside(double least, int digits) {
+        long lo = Double.doubleToLongBits(least);
+        long hi = Double.doubleToLongBits(least * Math.pow(2, BEYOND_ANY_RANGE));
+        // A positive double's bits order as its value does.
+        while (hi - lo > 1) {
+            long mid = (lo + hi) >>> 1;
+            if (stockTakes(least, Double.longBitsToDouble(mid), digits)) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return Double.longBitsToDouble(lo);
+    }
+
+    /**
+     * The least value at the top edge of its histogram bucket, where the cut
+     * lowers it the most, and the greatest value at the range limit stock's
+     * histogram has beside it: served with stock's values, and a value just
+     * past the limit refused as stock refuses it. The histogram moves its
+     * range by powers of two from the least value's, and the cut keeps the
+     * least value in its bucket, so it never narrows how far apart the
+     * values may be.
+     */
+    public void testLeastValueAtABucketTopAndGreatestAtTheRangeLimit() {
+        for (int digits = 0; digits <= 5; digits++) {
+            // Anywhere, and just under a power of two, where log2 may round up to it.
+            assertAtTheRangeLimit(Math.pow(2, randomDoubleBetween(-EDGE_EXPONENTS, EDGE_EXPONENTS, true)), digits);
+            assertAtTheRangeLimit(Math.nextDown(Math.pow(2, randomIntBetween(-EDGE_EXPONENTS, EDGE_EXPONENTS))), digits);
+        }
+    }
+
+    /**
+     * {@code d} cut to {@link #EDGE_DIGITS} significant decimal digits,
+     * rounding as {@code mode} says. A double written with that few digits
+     * reads back from the table exactly; one written with all seventeen can
+     * read back one unit in the last place off, which would move a value
+     * off the edge it is meant to sit on.
+     */
+    private static double shortDecimal(double d, RoundingMode mode) {
+        return new BigDecimal(d).round(new MathContext(EDGE_DIGITS, mode)).doubleValue();
+    }
+
+    /**
+     * The top of {@code base}'s bucket as the least value, beside the
+     * greatest value stock takes with it, then beside the least value past
+     * that, each as close to its edge as a short decimal gets.
+     */
+    private void assertAtTheRangeLimit(double base, int digits) {
+        DoubleHistogram one = new DoubleHistogram(digits);
+        one.setAutoResize(true);
+        one.recordValue(base);
+        double least = shortDecimal(Math.nextDown(one.nextNonEquivalentValue(base)), RoundingMode.DOWN);
+        assertTrue(one.valuesAreEquivalent(base, least));
+        // The histogram's range ends at a power of two: the least value past it.
+        double limit = Math.nextUp(greatestBeside(least, digits));
+        assertEquals(limit, Math.pow(2, Math.getExponent(limit)), 0.0);
+        double greatest = shortDecimal(Math.nextDown(limit), RoundingMode.DOWN);
+        double past = shortDecimal(limit, RoundingMode.UP);
+        assertTrue(stockTakes(least, greatest, digits));
+        assertFalse(stockTakes(least, past, digits));
+        assertTrue("the table reads the edge values back as written", readsBack(least, greatest, past));
+
+        resetTable();
+        index(List.of(new Doc("a", null, least), new Doc("a", null, greatest)));
+        // One shard's histogram, the two values recorded as written, as
+        // stock answers a one-shard index: copying a histogram this wide, as
+        // a reduce over several shards starts by doing, can itself throw.
+        DoubleHistogram shard = new DoubleHistogram(digits);
+        shard.setAutoResize(true);
+        shard.recordValue(least);
+        shard.recordValue(greatest);
+        double[] percents = percents();
+        InternalHDRPercentiles p = (InternalHDRPercentiles) run(
+            AggregationBuilders.percentiles("p").field("d").percentiles(percents).percentilesConfig(new PercentilesConfig.Hdr(digits))
+        );
+        assertEquals(shard.getTotalCount(), p.getState().getTotalCount());
+        for (double percent : percents) {
+            assertEquals("digits " + digits + " p" + percent, shard.getValueAtPercentile(percent), p.percentile(percent), 0.0);
+        }
+        double[] ranked = { least, greatest, one.lowestEquivalentValue(least) };
+        InternalHDRPercentileRanks r = (InternalHDRPercentileRanks) run(
+            AggregationBuilders.percentileRanks("r", ranked).field("d").percentilesConfig(new PercentilesConfig.Hdr(digits))
+        );
+        for (double v : ranked) {
+            assertEquals("digits " + digits + " rank of " + v, InternalHDRPercentileRanks.percentileRank(shard, v), r.percent(v), 0.0);
+        }
+
+        resetTable();
+        index(List.of(new Doc("a", null, least), new Doc("a", null, past)));
+        expectThrows(
+            ArrayIndexOutOfBoundsException.class,
+            () -> run(AggregationBuilders.percentiles("p").field("d").percentiles(50).percentilesConfig(new PercentilesConfig.Hdr(digits)))
+        );
+    }
+
+    /** Whether the table reads each of {@code values} back as written. */
+    private static boolean readsBack(double... values) {
+        resetTable();
+        List<Doc> docs = new ArrayList<>();
+        for (double v : values) {
+            docs.add(new Doc("a", null, v));
+        }
+        index(docs);
+        List<Double> read = new ArrayList<>();
+        for (Map<String, Object> row : InfinoNative.sqlRows("SELECT d FROM \"" + TABLE + "\"")) {
+            read.add(((Number) row.get("d")).doubleValue());
+        }
+        for (double v : values) {
+            if (!read.contains(v)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** A negative value is refused, as stock's histogram refuses it, rather than left out. */

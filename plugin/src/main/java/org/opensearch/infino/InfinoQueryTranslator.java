@@ -1523,6 +1523,8 @@ final class InfinoQueryTranslator {
     private String bool(BoolQueryBuilder b, boolean positive) {
         refuseTooManyClauses(b);
         List<String> and = new ArrayList<>();
+        // requires() reads must and filter clauses as this does, for a bool
+        // under a should: a change here belongs there too.
         for (QueryBuilder c : b.must()) {
             and.add(predicate(c, positive));
         }
@@ -1603,9 +1605,12 @@ final class InfinoQueryTranslator {
      * ({@link #requires}), a clause every one requires is required once,
      * clauses that are each one term on the same field are one IN list, and
      * clauses that are each a term on the same few columns are one IN list
-     * of tuples ({@link #tupleIn}). Each step keeps the rows: AND and OR
+     * of tuples ({@link #tupleIn}); a match on an exact field is read as a
+     * term ({@link #exactValue}). Each step keeps the rows: AND and OR
      * distribute over each other in SQL's three-valued logic too. When none
-     * applies, the clauses are joined by OR as written.
+     * applies, the clauses are joined by OR as written, and a statement past
+     * the engine's limit is refused with a 400 naming it
+     * ({@link InfinoNative#tooManyConnectives}).
      */
     private String anyOf(List<QueryBuilder> should) {
         List<String> whole = new ArrayList<>();
@@ -1649,7 +1654,7 @@ final class InfinoQueryTranslator {
                 List<Object> values = new ArrayList<>();
                 for (List<Required> m : members) {
                     QueryBuilder c = m.get(0).clause();
-                    values.addAll(c instanceof TermQueryBuilder t ? List.of(t.value()) : ((TermsQueryBuilder) c).values());
+                    values.addAll(c instanceof TermsQueryBuilder ts ? ts.values() : List.of(exactValue(c)));
                 }
                 or.add(inList((String) g.getKey().get(1), values.stream().distinct().toList()));
                 merged = true;
@@ -1672,16 +1677,18 @@ final class InfinoQueryTranslator {
 
     /**
      * Which group the rest of the {@code i}th should clause joins: one term
-     * (or terms) on a field, the field's IN group; a term on each of two or
-     * more columns, each compared as a plain {@code column = literal} (no
-     * list column, no address block, no case folding), the tuple group of
-     * those columns; anything else, a group of its own.
+     * (or terms, or a match on an exact field) on a field, the field's IN
+     * group; a term or match on each of two or more columns, each compared
+     * as a plain {@code column = literal} (no list column, no address block,
+     * no case folding), the tuple group of those columns; anything else, a
+     * group of its own.
      */
     private List<Object> groupKey(List<Required> rest, int i) {
         if (rest.size() == 1) {
             QueryBuilder c = rest.get(0).clause();
             String field = c instanceof TermQueryBuilder t && !t.caseInsensitive() ? t.fieldName()
                 : c instanceof TermsQueryBuilder ts && ts.termsLookup() == null ? ts.fieldName()
+                : c instanceof MatchQueryBuilder m && exactValue(m) != null ? m.fieldName()
                 : null;
             if (field != null && listable(field)) {
                 return List.of(IN_GROUP, field);
@@ -1710,17 +1717,42 @@ final class InfinoQueryTranslator {
         return c != null && !c.fts();
     }
 
+    /**
+     * The value {@code qb} compares its field's column with, as an equality
+     * does: a term's own (not case-insensitive), or a match's on an exact
+     * column, which {@link #text} reads as an equality of the value as
+     * written. Null for any other clause, and for a match on a text column
+     * or on a field with no column ({@code _id} among them), which the
+     * match reads otherwise.
+     */
+    private Object exactValue(QueryBuilder qb) {
+        if (qb instanceof TermQueryBuilder t && !t.caseInsensitive()) {
+            return t.value();
+        }
+        if (qb instanceof MatchQueryBuilder m && m.value() != null) {
+            Column c = column(m.fieldName());
+            return c != null && !c.fts() ? String.valueOf(m.value()) : null;
+        }
+        return null;
+    }
+
     /** The column {@code r} compares as exactly {@code column = literal}, or null when it is any other clause. */
     private Column plainEquality(Required r) {
-        if (!(r.clause() instanceof TermQueryBuilder t) || t.caseInsensitive() || t.value() == null || !listable(t.fieldName())) {
+        Object value = exactValue(r.clause());
+        if (value == null || !listable(exactField(r.clause()))) {
             return null;
         }
-        Column c = column(t.fieldName());
+        Column c = column(exactField(r.clause()));
         if (c == null) {
             return null;
         }
-        String lit = scalar(c.element(), t.value(), false);
+        String lit = scalar(c.element(), value, false);
         return lit != null && r.predicate().equals(quoteIdent(c.name()) + " = " + lit) ? c : null;
+    }
+
+    /** The field of a clause {@link #exactValue} reads. */
+    private static String exactField(QueryBuilder qb) {
+        return qb instanceof TermQueryBuilder t ? t.fieldName() : ((MatchQueryBuilder) qb).fieldName();
     }
 
     /**
@@ -1740,7 +1772,7 @@ final class InfinoQueryTranslator {
             String[] row = new String[names.size()];
             for (Required r : m) {
                 Column c = plainEquality(r);
-                row[names.indexOf(c.name())] = scalar(c.element(), ((TermQueryBuilder) r.clause()).value(), false);
+                row[names.indexOf(c.name())] = scalar(c.element(), exactValue(r.clause()), false);
             }
             rows.add("(" + String.join(", ", row) + ")");
         }
@@ -1756,6 +1788,8 @@ final class InfinoQueryTranslator {
      */
     private String requires(QueryBuilder qb, List<Required> out) {
         if (qb instanceof BoolQueryBuilder b && b.hasClauses() && b.should().isEmpty() && b.mustNot().isEmpty()) {
+            // The must and filter part of bool(), keeping each clause it
+            // requires: a change there belongs here too.
             refuseTooManyClauses(b);
             List<String> and = new ArrayList<>();
             for (QueryBuilder c : b.must()) {
