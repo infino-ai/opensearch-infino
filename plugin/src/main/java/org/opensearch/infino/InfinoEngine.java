@@ -58,7 +58,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiFunction;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 import java.util.function.LongUnaryOperator;
 import java.util.function.Predicate;
@@ -216,6 +218,11 @@ public class InfinoEngine extends InternalEngine {
      */
     static final long RATE_LIMIT_PAUSE_MIN_NANOS = TimeUnit.SECONDS.toNanos(1);
     static final long RATE_LIMIT_PAUSE_MAX_NANOS = TimeUnit.SECONDS.toNanos(30);
+    /**
+     * The longest a history fill held back by a full backlog parks before it
+     * looks again whether the engine is closing (see {@link #commitHeldBack}).
+     */
+    static final long FILL_CLOSE_CHECK_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
     /** The changes-snapshot source of the history a new primary writes into the table. */
     private static final String FILL_SOURCE = "infino_fill";
     /** A sequence number below every operation's: what a primary that handed its shard off may commit through. */
@@ -462,7 +469,12 @@ public class InfinoEngine extends InternalEngine {
 
         /** Whether a commit at {@code now} waits, making no call. */
         synchronized boolean waits(long now) {
-            return pause > 0 && now - notBefore < 0;
+            return remaining(now) > 0;
+        }
+
+        /** How long a commit at {@code now} still waits before it may call the service; 0 when it need not. */
+        synchronized long remaining(long now) {
+            return pause > 0 && now - notBefore < 0 ? notBefore - now : 0;
         }
 
         /** Record a commit made at {@code now}: whether the service turned it away for the rate. */
@@ -1267,9 +1279,24 @@ public class InfinoEngine extends InternalEngine {
             waiting = batch.size() + (committing == null ? 0 : committing.size());
             bytes = batch.bytes + (committing == null ? 0 : committing.bytes);
         }
-        if (waiting >= (long) MAX_PENDING_BATCHES * MAX_BATCH_DOCS || bytes >= MAX_PENDING_BATCHES * MAX_BATCH_BYTES) {
+        if (pastBacklog(waiting, bytes)) {
             throw new OpenSearchRejectedExecutionException(
                 "[infino] " + waiting + " writes to table " + table + " are waiting for a commit; the write is refused until the table takes them"
+            );
+        }
+    }
+
+    /** Whether {@code waiting} writes of {@code bytes} waiting for a commit are as many as may wait ({@link #MAX_PENDING_BATCHES} batches' worth). */
+    private static boolean pastBacklog(long waiting, long bytes) {
+        return waiting >= (long) MAX_PENDING_BATCHES * MAX_BATCH_DOCS || bytes >= MAX_PENDING_BATCHES * MAX_BATCH_BYTES;
+    }
+
+    /** Whether as many writes wait for a commit as may (see {@link #refuseWhileBacklogged}). */
+    private boolean backlogged() {
+        synchronized (batchLock) {
+            return pastBacklog(
+                batch.size() + (committing == null ? 0 : committing.size()),
+                batch.bytes + (committing == null ? 0 : committing.bytes)
             );
         }
     }
@@ -1840,10 +1867,10 @@ public class InfinoEngine extends InternalEngine {
      * looking each row up first since the service may have committed the
      * append and only its answer was lost, so a retried row replaces the one
      * already there rather than being added again; turned away for the
-     * rate, the batch wrote nothing, so each write keeps the base it had. An
-     * append the service ended partway reports the documents it did not
-     * write one by one instead, as not taken ({@link #notTaken}), and only
-     * those are retried. Every write to retry carries the base the next
+     * rate, the batch wrote nothing, so each write keeps the base it had, or
+     * the one the lookup found when it ran. An append the service ended
+     * partway reports the documents it did not write one by one instead, as
+     * not taken ({@link #notTaken}), and only those are retried. Every write to retry carries the base the next
      * commit starts from.
      */
     static Written write(
@@ -1889,6 +1916,8 @@ public class InfinoEngine extends InternalEngine {
         }
         Batch retry = new Batch();
         boolean rateLimited = false;
+        // Whether the lookup answered: then `replaced` says which looked-up ids hold a row.
+        boolean lookedUpAnswered = lookedUp.isEmpty();
         try {
             // An id this node has no record of may be a row another node wrote:
             // a replayed operation, after a takeover, of a write that node
@@ -1897,6 +1926,7 @@ public class InfinoEngine extends InternalEngine {
             holdLatest.accept(!lookedUp.isEmpty());
             if (!lookedUp.isEmpty()) {
                 replaced.addAll(InfinoNative.existingOsidsLatest(table, lookedUp));
+                lookedUpAnswered = true;
             }
             // Deletes go first: until a commit's rows are in, the highest operation the
             // table records is an earlier commit's, from which a new primary writes on.
@@ -1947,12 +1977,17 @@ public class InfinoEngine extends InternalEngine {
             // The write's sync is not failed for it (see commitBeforeSync): a
             // client that retried an auto-id bulk would get its documents twice.
             // A call turned away for the rate wrote nothing, so each write keeps
-            // its base; one that was not answered may have landed, so each is
-            // looked up.
+            // its base, and one this commit looked up takes what the lookup found,
+            // so the next commit does not look it up again; one that was not
+            // answered may have landed, so each is looked up.
             log.warn("[infino] the hosted service did not take a commit of {} writes and {} deletes to {}; the next commit tries again: {}", ids.size(), deleted.size(), table, e.getMessage());
             if (!rateLimited) {
                 for (Entry entry : b.entries.values()) {
                     entry.base = Base.UNKNOWN;
+                }
+            } else if (lookedUpAnswered) {
+                for (String id : lookedUp) {
+                    b.entries.get(id).base = replaced.contains(id) ? Base.PRESENT : Base.ABSENT;
                 }
             }
             retry = b;
@@ -2242,7 +2277,7 @@ public class InfinoEngine extends InternalEngine {
      * this copy's. Writes arrive meanwhile, so it reads the history through
      * what this copy has processed; those after it are its own, in the
      * batch. A history that cannot be written fails the engine, as it fails
-     * a promotion.
+     * a promotion; one a close stops does not.
      */
     private void fillAfterHandOff() {
         assert Thread.holdsLock(commitLock);
@@ -2255,6 +2290,8 @@ public class InfinoEngine extends InternalEngine {
             fillTable(getProcessedLocalCheckpoint());
             filled = true;
             log.info("[infino] {} holds the history of {} after its move here; updates merge here", table, shardId);
+        } catch (AlreadyClosedException e) {
+            throw e; // a close stopped the fill; the translog and the table's lease keep what the table lacks
         } catch (IOException | RuntimeException e) {
             failEngine("writing the history of " + shardId + " into " + table + " after its move failed", e);
             throw new IllegalStateException("[infino] writing the history of " + shardId + " into " + table + " after its move failed", e);
@@ -2276,6 +2313,71 @@ public class InfinoEngine extends InternalEngine {
             log.warn("[infino] {} could not parse document {} from its history again for its ignored fields: {}", shardId, id, e.getMessage());
             return List.of();
         }
+    }
+
+    /**
+     * Commit a full batch of the history {@link #fillTable} writes. A commit
+     * the rate limit holds back, or one that fails, leaves the writes in the
+     * batch; the fill then waits, while as many writes wait as new writes may
+     * ({@link #backlogged}), and commits again (see {@link #commitHeldBack}),
+     * so it never reads more of the history into memory than that. A
+     * closing engine stops it: its history keeps what the table lacks.
+     */
+    private void commitPartOfFill() {
+        boolean committed = commitHeldBack(() -> {
+            try {
+                return commitBatch();
+            } catch (RuntimeException e) {
+                // The writes stay in the batch for the next commit, as the last one's do.
+                log.warn("[infino] committing part of the history {} took over to {} failed", shardId, table, e);
+                return false;
+            }
+        }, this::backlogged, rateLimit, () -> closing || isClosed.get(), System::nanoTime, LockSupport::parkNanos);
+        if (!committed) {
+            throw new AlreadyClosedException("[infino] " + shardId + " closed while writing its history into " + table + "; the history keeps the rest");
+        }
+    }
+
+    /**
+     * Commit ({@code commit}, false when it left writes behind), and while it
+     * leaves them behind and {@code backlogged} holds, wait and commit again:
+     * until the rate limit's pause ends ({@link RateLimit#remaining}), or,
+     * when no pause holds the commit back (it failed, or the table did not
+     * take every write), for a backoff of its own that doubles from
+     * {@link #RATE_LIMIT_PAUSE_MIN_NANOS} up to
+     * {@link #RATE_LIMIT_PAUSE_MAX_NANOS}, so a service that keeps failing is
+     * not called in a loop. It parks at most {@link #FILL_CLOSE_CHECK_NANOS}
+     * at a time to look at {@code stopped}; false when that stopped it. No
+     * write is dropped: the writes wait in the batch until a commit takes them.
+     */
+    static boolean commitHeldBack(
+        BooleanSupplier commit,
+        BooleanSupplier backlogged,
+        RateLimit limit,
+        BooleanSupplier stopped,
+        LongSupplier clock,
+        LongConsumer park
+    ) {
+        long backoff = 0;
+        while (!commit.getAsBoolean() && backlogged.getAsBoolean()) {
+            long now = clock.getAsLong();
+            long wait = limit.remaining(now);
+            if (wait == 0) {
+                backoff = backoff == 0 ? RATE_LIMIT_PAUSE_MIN_NANOS : Math.min(RATE_LIMIT_PAUSE_MAX_NANOS, backoff * 2);
+                wait = backoff;
+            }
+            long until = now + wait;
+            for (long left = wait; left > 0; left = until - clock.getAsLong()) {
+                if (stopped.getAsBoolean()) {
+                    return false;
+                }
+                park.accept(Math.min(left, FILL_CLOSE_CHECK_NANOS));
+            }
+            if (stopped.getAsBoolean()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -2360,12 +2462,7 @@ public class InfinoEngine extends InternalEngine {
                 }
                 written++;
                 if (full) {
-                    try {
-                        commitBatch();
-                    } catch (RuntimeException e) {
-                        // The writes stay in the batch for the next commit, as the last one's do.
-                        log.warn("[infino] committing part of the history {} took over to {} failed", shardId, table, e);
-                    }
+                    commitPartOfFill();
                 }
             }
         }

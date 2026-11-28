@@ -34,6 +34,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.LongConsumer;
 
 import static org.mockito.Mockito.mock;
@@ -499,6 +500,141 @@ public class InfinoEngineTests extends OpenSearchTestCase {
             assertTrue(random.waits(min / 2 - 1));
             assertFalse(random.waits(min));
         }
+    }
+
+    /**
+     * A whole commit the hosted service turns away for the account's request
+     * rate after the commit looked its rows up comes back with what the
+     * lookup found under each id, so the next commit writes them without a
+     * second lookup. When the lookup itself is turned away, nothing was
+     * found, and the rows are still looked up.
+     */
+    public void testAWholeCommitRateLimitedAfterItsLookupKeepsWhatTheLookupFound() {
+        String limited = "{\"error\":\"backend: append: server returned 429: rate limit exceeded\",\"status\":429}";
+        for (boolean lookupLimited : new boolean[] { false, true }) {
+            AtomicInteger appends = new AtomicInteger();
+            AtomicInteger lookups = new AtomicInteger();
+            InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+                case "infino_open_with", "infino_prepare_batch_meta" -> new Memory(1);
+                case "infino_sql_latest" -> string(
+                    lookups.incrementAndGet() == 1 && lookupLimited ? limited : "[{\"osid\":\"old\"}]" // "old" holds a row, "new" none
+                );
+                // The first commit is turned away once: at its lookup, or else at its append.
+                case "infino_append_prepared" -> string(
+                    appends.incrementAndGet() == 1 && !lookupLimited ? limited : "{\"ok\":2,\"failed\":[]}"
+                );
+                case "infino_check_doc" -> throw new AssertionError("a document turned away for the rate was checked");
+                default -> null; // the latest hold and its release, and the frees
+            }));
+            try {
+                InfinoEngine.Batch batch = new InfinoEngine.Batch();
+                batch.add("new", InfinoEngine.Base.UNKNOWN, new InfinoEngine.Version(0, true, "{\"n\":0}", null, -1, null));
+                batch.add("old", InfinoEngine.Base.UNKNOWN, new InfinoEngine.Version(1, true, "{\"n\":1}", null, -1, null));
+
+                InfinoEngine.Written written = InfinoEngine.write("t", 1, batch, held -> {}, () -> {}, (id, v) -> null);
+                assertTrue(written.rateLimited());
+                assertEquals(lookupLimited ? 0 : 1, appends.get());
+                InfinoEngine.Base absent = lookupLimited ? InfinoEngine.Base.UNKNOWN : InfinoEngine.Base.ABSENT;
+                InfinoEngine.Base present = lookupLimited ? InfinoEngine.Base.UNKNOWN : InfinoEngine.Base.PRESENT;
+                assertEquals(absent, written.retry().entries.get("new").base);
+                assertEquals(present, written.retry().entries.get("old").base);
+
+                InfinoEngine.Batch open = new InfinoEngine.Batch();
+                open.putBack(written.retry(), false);
+                InfinoEngine.Written again = InfinoEngine.write("t", 1, open, held -> {}, () -> {}, (id, v) -> null);
+                assertTrue(again.retry().isEmpty());
+                assertEquals("one lookup across both commits unless the first was turned away", lookupLimited ? 2 : 1, lookups.get());
+            } finally {
+                InfinoNative.useLib(null);
+            }
+        }
+    }
+
+    /**
+     * A new primary writing its history into the table under a rate limit:
+     * each commit of a full batch is held back until the pause ends, and
+     * once as many writes wait as may, the fill waits for the pause rather
+     * than reading more of the history into memory. It makes no call before
+     * a pause ends, holds no more than the backlog, and every operation
+     * reaches the table: none is dropped.
+     */
+    public void testAHistoryFillHeldBackByARateLimitWaitsWithItsBacklogBounded() {
+        int perBatch = 10;
+        int backlog = 4 * perBatch;
+        int history = 50 * perBatch;
+        int turnedAway = 5;
+        AtomicLong clock = new AtomicLong();
+        InfinoEngine.RateLimit limit = new InfinoEngine.RateLimit(pause -> pause);
+        AtomicInteger pending = new AtomicInteger();
+        AtomicInteger committed = new AtomicInteger();
+        AtomicInteger calls = new AtomicInteger();
+        List<Long> callTimes = new ArrayList<>();
+        int most = 0;
+        // As commitBatch: no call while the pause holds; the first calls are turned away.
+        BooleanSupplier commit = () -> {
+            if (limit.waits(clock.get())) {
+                return false;
+            }
+            callTimes.add(clock.get());
+            if (calls.incrementAndGet() <= turnedAway) {
+                limit.after(true, clock.get());
+                return false;
+            }
+            limit.after(false, clock.get());
+            committed.addAndGet(pending.getAndSet(0));
+            return true;
+        };
+        for (int op = 1; op <= history; op++) {
+            pending.incrementAndGet();
+            most = Math.max(most, pending.get());
+            if (pending.get() % perBatch == 0) {
+                assertTrue(
+                    InfinoEngine.commitHeldBack(commit, () -> pending.get() >= backlog, limit, () -> false, clock::get, clock::addAndGet)
+                );
+            }
+        }
+        assertTrue(commit.getAsBoolean());
+        assertEquals("every operation of the history reaches the table", history, committed.get());
+        assertTrue("the fill holds no more than the backlog: " + most, most <= backlog);
+        // The calls turned away, the one that takes the backlog, one per batch after it, and the last commit.
+        assertEquals(turnedAway + 1 + (history - backlog) / perBatch + 1, calls.get());
+        // Each call after one turned away waits out the doubled pause.
+        long pause = InfinoEngine.RATE_LIMIT_PAUSE_MIN_NANOS;
+        for (int i = 1; i <= turnedAway; i++) {
+            assertTrue("call " + i + " waited", callTimes.get(i) - callTimes.get(i - 1) >= pause);
+            pause = Math.min(InfinoEngine.RATE_LIMIT_PAUSE_MAX_NANOS, pause * 2);
+        }
+    }
+
+    /**
+     * A fill whose commits fail with no rate limit to wait for backs off on
+     * its own, doubling up to the cap, rather than calling the service in a
+     * loop; a close stops it, and it then makes no further call.
+     */
+    public void testAHistoryFillWhoseCommitsFailBacksOffAndStopsOnClose() {
+        AtomicLong clock = new AtomicLong();
+        InfinoEngine.RateLimit limit = new InfinoEngine.RateLimit(pause -> pause);
+        List<Long> callTimes = new ArrayList<>();
+        AtomicBoolean closing = new AtomicBoolean();
+        int failures = 8;
+        BooleanSupplier failing = () -> {
+            callTimes.add(clock.get());
+            if (callTimes.size() == failures) {
+                closing.set(true);
+            }
+            return false; // the commit threw, and the writes stay in the batch
+        };
+        assertFalse(InfinoEngine.commitHeldBack(failing, () -> true, limit, closing::get, clock::get, clock::addAndGet));
+        assertEquals("no call after the close", failures, callTimes.size());
+        long backoff = InfinoEngine.RATE_LIMIT_PAUSE_MIN_NANOS;
+        for (int i = 1; i < failures; i++) {
+            assertEquals(backoff, callTimes.get(i) - callTimes.get(i - 1));
+            backoff = Math.min(InfinoEngine.RATE_LIMIT_PAUSE_MAX_NANOS, backoff * 2);
+        }
+        // A fill that is not past its backlog goes on at once, with no wait.
+        AtomicLong parked = new AtomicLong();
+        assertTrue(InfinoEngine.commitHeldBack(() -> false, () -> false, limit, () -> false, clock::get, parked::addAndGet));
+        assertEquals(0, parked.get());
     }
 
     /**
