@@ -2080,7 +2080,10 @@ final class InfinoQueryTranslator {
             return false;
         }
         if (isCidr(c, q)) {
-            return inBlock(v.toString(), q.toString());
+            return InfinoIp.inBlock(v, q.toString());
+        }
+        if (isIp(c)) {
+            return InfinoIp.sameAddress(v, q);
         }
         if (c.isString()) {
             return v.toString().equals(q.toString());
@@ -2170,26 +2173,44 @@ final class InfinoQueryTranslator {
 
     /** Whether {@code value}, in a term on {@code c}, is a CIDR block: on an ip field, text with a prefix length. */
     private static boolean isCidr(Column c, Object value) {
+        return isIp(c) && value != null && value.toString().indexOf('/') >= 0;
+    }
+
+    /** Whether {@code c} is an ip field's column (its element, for a list). */
+    private static boolean isIp(Column c) {
         InfinoNative.FieldType type = c.element().fieldType();
-        return type != null && type.isIp() && value != null && value.toString().indexOf('/') >= 0;
+        return type != null && type.isIp();
     }
 
     /**
-     * The test a CIDR block in a term on the ip field {@code field} makes of
-     * a value of its column, which holds each address as written: whether
-     * it lies in the block, as stock reads such a term (the addresses the
-     * block covers, its host bits ignored). An IPv4 address is written as
-     * four decimal octets, so the block is a prefix of that text: its whole
-     * octets as written, then a partial octet as the values it allows. An
-     * IPv6 block is refused: an IPv6 address has several textual forms
-     * (zeros compressed or not, an embedded IPv4 tail), so no pattern over
-     * the text finds every address in the block.
+     * An address in a term on an ip field as a literal of the spelling the
+     * column keeps it in ({@link InfinoIp#canonical}), so any spelling of it
+     * finds the rows; null for text that is not an address, which no row
+     * holds.
      */
-    static Function<String, String> cidr(String field, String block) {
+    private static String ipLiteral(Object value) {
+        String canonical = InfinoIp.canonical(value);
+        return canonical == null ? null : literal(canonical);
+    }
+
+    /**
+     * The test a CIDR block in a term on an ip field makes of a value of its
+     * column: whether it lies in the block, as stock reads such a term (the
+     * addresses the block covers, its host bits ignored). The column keeps
+     * an IPv4 address as four decimal octets, so an IPv4 block is a prefix
+     * of that text: its whole octets as written, then a partial octet as the
+     * values it allows. An IPv6 address has no such prefix in its text
+     * (zeros are compressed), so an IPv6 block compares each address's key
+     * ({@link InfinoIp#key}) to the keys the block spans; an IPv4 address
+     * keys as its IPv4-mapped form, so a block over that range finds it.
+     */
+    static Function<String, String> cidr(String block) {
         // A malformed block is refused with stock's message.
         Tuple<InetAddress, Integer> parsed = InetAddresses.parseCidr(block);
         if (!(parsed.v1() instanceof Inet4Address)) {
-            throw new IllegalArgumentException("[infino] a term with the IPv6 CIDR block [" + block + "] on [" + field + "] is not served");
+            String[] keys = InfinoIp.blockKeys(block);
+            String between = " BETWEEN '" + keys[0] + "' AND '" + keys[1] + "'";
+            return v -> "(" + InfinoIp.key(v) + between + ")";
         }
         byte[] address = parsed.v1().getAddress();
         int bits = parsed.v2();
@@ -2218,29 +2239,6 @@ final class InfinoQueryTranslator {
         String pattern = "^" + whole.toString().replace(".", "\\.") + "(?:" + String.join("|", allowed) + ")" + (octet < 3 ? "\\." : "$");
         String lit = literal(pattern);
         return v -> "regexp_like(" + v + ", " + lit + ")";
-    }
-
-    /** Whether the address {@code address} lies in the CIDR block {@code block}; false for text that is not an address. */
-    private static boolean inBlock(String address, String block) {
-        Tuple<InetAddress, Integer> parsed = InetAddresses.parseCidr(block);
-        byte[] net = parsed.v1().getAddress();
-        byte[] ip;
-        try {
-            ip = InetAddresses.forString(address).getAddress();
-        } catch (IllegalArgumentException e) {
-            return false;
-        }
-        if (ip.length != net.length) {
-            return false;
-        }
-        int bits = parsed.v2();
-        for (int i = 0; i < net.length && bits > 0; i++, bits -= 8) {
-            int mask = bits >= 8 ? 0xff : 0xff << (8 - bits) & 0xff;
-            if ((ip[i] & mask) != (net[i] & mask)) {
-                return false;
-            }
-        }
-        return true;
     }
 
     private static BigDecimal decimal(Object v) {
@@ -3338,7 +3336,11 @@ final class InfinoQueryTranslator {
             return c == null ? NONE : null;
         }
         if (isCidr(c, value)) {
-            return anyValue(c, cidr(field, value.toString()));
+            return anyValue(c, cidr(value.toString()));
+        }
+        if (isIp(c)) {
+            String lit = ipLiteral(value);
+            return lit == null ? NONE : anyValue(c, v -> v + " = " + lit);
         }
         String lit = scalar(c.element(), value, false);
         return lit == null ? null : anyValue(c, v -> v + " = " + lit);
@@ -3369,16 +3371,30 @@ final class InfinoQueryTranslator {
         if (values == null || values.isEmpty()) {
             return NONE;
         }
-        if (values.stream().anyMatch(v -> isCidr(c, v))) {
-            // Each value its own test, a block's addresses or one address, any of them a match.
+        if (isIp(c)) {
+            // Each value its own test, a block's addresses or one address,
+            // any of them a match; text that is no address matches nothing.
+            List<String> lits = new ArrayList<>();
             List<Function<String, String>> tests = new ArrayList<>();
             for (Object v : values) {
                 if (isCidr(c, v)) {
-                    tests.add(cidr(field, v.toString()));
-                } else if (v != null) {
-                    String lit = scalar(c.element(), v, false);
-                    tests.add(x -> x + " = " + lit);
+                    tests.add(cidr(v.toString()));
+                } else {
+                    String lit = ipLiteral(v);
+                    if (lit != null && !lits.contains(lit)) {
+                        lits.add(lit);
+                    }
                 }
+            }
+            if (!lits.isEmpty()) {
+                String in = lits.size() == 1 ? " = " + lits.get(0) : " IN (" + String.join(", ", lits) + ")";
+                tests.add(0, x -> x + in);
+            }
+            if (tests.isEmpty()) {
+                return NONE;
+            }
+            if (tests.size() == 1) {
+                return anyValue(c, tests.get(0));
             }
             return anyValue(c, x -> {
                 List<String> any = new ArrayList<>(tests.size());

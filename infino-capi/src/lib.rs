@@ -42,6 +42,7 @@ use std::ffi::{c_char, CStr, CString};
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::iter;
+use std::net::IpAddr;
 use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -1781,9 +1782,34 @@ impl Valid {
     /// Whether OpenSearch accepts a value its column took.
     fn accepts(self, v: &Value) -> bool {
         match self {
-            Self::Ip => v.as_str().is_some_and(|s| s.parse::<std::net::IpAddr>().is_ok()),
+            Self::Ip => v.as_str().is_some_and(|s| s.parse::<IpAddr>().is_ok()),
             Self::Integer(min, max) => v.as_i64().is_some_and(|n| (min..=max).contains(&n)),
         }
+    }
+
+    /// The value as its column keeps it: an address of an `ip` field in the
+    /// one spelling stock prints it in ([`canonical_ip`]), so a query can
+    /// compare any spelling of an address by that spelling. Anything else is
+    /// kept as it is.
+    fn keep(self, v: Value) -> Value {
+        match (self, &v) {
+            (Self::Ip, Value::String(s)) => canonical_ip(s).map_or(v, Value::String),
+            _ => v,
+        }
+    }
+}
+
+/// The address `text` spells, written as stock prints an `ip` field's
+/// value: an IPv4 address (an IPv4-mapped IPv6 one, `::ffff:a.b.c.d`,
+/// included) in dotted decimal, any other IPv6 address in lowercase hex with
+/// the longest run of zero groups compressed. An address has many spellings
+/// (`2001:db8::2`, `2001:DB8:0:0:0:0:0:2`, `2001:0db8::0002`), and stock
+/// reads every one as the same 16 bytes; one spelling makes them one value.
+/// None when the text is no address.
+fn canonical_ip(text: &str) -> Option<String> {
+    match text.parse::<IpAddr>().ok()? {
+        IpAddr::V4(v4) => Some(v4.to_string()),
+        IpAddr::V6(v6) => Some(v6.to_ipv4_mapped().map_or_else(|| v6.to_string(), |v4| v4.to_string())),
     }
 }
 
@@ -3920,6 +3946,7 @@ fn conform_doc(
             Some(Kept::Date(formats)) if matches!(dt, DataType::Timestamp(..)) => {
                 conform_date(v, formats)
             }
+            Some(Kept::Valid(valid)) => conform(v, dt).map(|v| valid.keep(v)),
             _ => conform(v, dt).and_then(|v| keep(v, rule.and_then(Kept::precision))),
         };
         // Of an ignored field's values, those OpenSearch indexed: the mapper
@@ -9646,6 +9673,33 @@ mod tests {
         assert!(flat.is_empty(), "{flat:?}");
         // Not ignored, the same array is refused.
         assert!(row(r#"{"n":[1,"x",3]}"#, &[]).is_err());
+    }
+
+    #[test]
+    fn an_ip_value_is_kept_in_the_spelling_stock_prints() {
+        for (written, kept) in [
+            ("2001:db8::2", "2001:db8::2"),
+            ("2001:db8:0:0:0:0:0:2", "2001:db8::2"),
+            ("2001:0DB8:0000:0000:0000:0000:0000:0002", "2001:db8::2"),
+            ("::ffff:10.0.0.7", "10.0.0.7"),
+            ("::FFFF:a00:7", "10.0.0.7"),
+            ("10.0.0.7", "10.0.0.7"),
+            ("0:0:0:0:0:0:0:1", "::1"),
+            ("1:0:0:1:0:0:1:1", "1::1:0:0:1:1"),
+            ("::1.2.3.4", "::102:304"),
+        ] {
+            assert_eq!(canonical_ip(written).as_deref(), Some(kept), "{written}");
+        }
+        assert_eq!(canonical_ip("garbage"), None);
+        let schema = Schema::new(vec![
+            Field::new("ip", DataType::LargeUtf8, true),
+            Field::new("ip[]", DataType::List(Arc::new(Field::new(LIST_ITEM, DataType::LargeUtf8, true))), true),
+        ]);
+        let kept: HashMap<String, Kept> = [("ip".to_string(), Kept::Valid(Valid::Ip))].into_iter().collect();
+        let row = |doc: &str| conform_doc(doc, &Columns::of(&schema), &kept, &[], None, &[], &Indexed::default()).unwrap();
+        assert_eq!(row(r#"{"ip":"2001:DB8:0:0:0:0:0:2"}"#).get("ip"), Some(&json!("2001:db8::2")));
+        let flat = row(r#"{"ip":["::ffff:10.0.0.7","2001:0db8::0002"]}"#);
+        assert_eq!(flat.get("ip[]"), Some(&json!(["10.0.0.7", "2001:db8::2"])), "{flat:?}");
     }
 
     #[test]
