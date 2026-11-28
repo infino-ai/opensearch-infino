@@ -147,9 +147,11 @@ test {
 // a task of their own, on a cluster of the archive with the k-NN plugin, and
 // every other suite keeps the integration-test distribution without it. The
 // knn cluster keeps its own catalog, so neither cluster sees the other's tables.
+// The skeleton rebuild of an index with a vector field runs there too: the
+// k-NN plugin writes the source of each of its writes anew.
 def knnTask = 'knnYamlRestTest'
 def knnSuite = 'infino/100_knn'
-def knnTests = 'org.opensearch.infino.InfinoStockKnnIT'
+def knnTests = 'org.opensearch.infino.Infino*KnnIT'
 def knnData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog-knn"
 
 // Default mode with a replica needs a second node: a copy recovers from the
@@ -417,6 +419,10 @@ testClusters.matching { it.name == unsharedTask }.all {
 tasks.named('yamlRestTest').configure {
     // Only the plugin's own suites: the stock ones copied beside them run in the core tasks.
     systemProperty 'tests.rest.suite', 'infino'
+    // The test node's log, for a test that checks what the node did not write to a table.
+    // tests.config names the one file beyond its own the test security manager lets a
+    // test read, and no test of this suite reads a config file of its own.
+    systemProperty 'tests.config', "${layout.buildDirectory.get().asFile.absolutePath}/testclusters/yamlRestTest-0/logs/yamlRestTest.log"
     systemProperty 'tests.rest.denylist', "${knnSuite}/*"
     filter {
         excludeTestsMatching coreTests

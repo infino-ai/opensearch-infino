@@ -7,11 +7,18 @@ package org.opensearch.infino;
 import org.opensearch.client.ResponseException;
 
 import java.io.IOException;
+import java.nio.channels.Channels;
+import java.nio.channels.SeekableByteChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * A default-mode index as the registry recreates it on a fresh cluster:
@@ -44,6 +51,20 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
     private static final String HELD_DELETED = "h1";
     /** The cluster setting that holds skeleton rebuilds. */
     private static final String PAUSED = "infino.skeleton_rebuild.paused";
+    /** The table of the untouched-rows test's indices, and its rows. */
+    private static final String KEPT_TABLE = "emr8_rows";
+    private static final int KEPT_ROWS = 200;
+    /** The table of the final-pipeline test's indices, its rows, and the pipeline. */
+    private static final String PIPELINE_TABLE = "emr9_rows";
+    private static final int PIPELINE_ROWS = 50;
+    private static final String FINAL_PIPELINE = "emr9_final";
+    /**
+     * The system property naming the test node's log: the build sets it,
+     * since the test security manager lets a test read the one file it names.
+     */
+    private static final String SERVER_LOG = "tests.config";
+    /** The mark a rebuild's creates open their source with, which a client's write may not carry. */
+    private static final String MARK = "/*infino:skeleton*/";
 
     @SuppressWarnings("unchecked")
     public void testARebuiltIndexGetsItsRowsBackAndKeepsThemOnce() throws Exception {
@@ -160,6 +181,144 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         call("DELETE", "/emr3", null);
     }
 
+    /**
+     * A rebuild writes the skeleton alone: the table already holds every
+     * row, so each keeps the engine's id it had, rather than being written
+     * again as a new row. A primary that starts again from its own store,
+     * or as the index is opened again, writes the table the operations of
+     * its history the table may not hold: the rebuild's creates are among
+     * them, and the rows stay as they are. A client's write may not carry
+     * the mark that keeps a rebuild's creates out of the table.
+     */
+    @SuppressWarnings("unchecked")
+    public void testARebuildLeavesTheTableAsItIs() throws Exception {
+        createIndex("emr8_old", false, KEPT_TABLE, 1);
+        StringBuilder bulk = new StringBuilder();
+        for (int i = 0; i < KEPT_ROWS; i++) {
+            bulk.append("{\"index\":{\"_index\":\"emr8_old\",\"_id\":\"k").append(i).append("\"}}\n");
+            bulk.append("{\"n\":").append(i).append("}\n");
+        }
+        assertEquals(false, call("POST", "/_bulk?refresh=true", bulk.toString()).get("errors"));
+        Map<String, Object> before = rowIds("emr8_old");
+        assertEquals(KEPT_ROWS, before.size());
+        call("DELETE", "/emr8_old", null);
+
+        createIndex("emr8", true, KEPT_TABLE, 1);
+        // The shard's own document count, which a search of a skeleton being rebuilt does not wait for.
+        assertBusy(() -> {
+            Map<String, Object> index = (Map<String, Object>) callList("GET", "/_cat/indices/emr8?format=json&h=docs.count", null).get(0);
+            assertEquals(String.valueOf(KEPT_ROWS), index.get("docs.count"));
+        }, REBUILD_SECONDS, TimeUnit.SECONDS);
+        assertEquals("every row keeps its engine id through the rebuild", before, rowIds("emr8"));
+
+        // Fail the primary and allocate it again from its own store. The cancel
+        // closes the shard cleanly, which flushes, so the start replays nothing
+        // from its translog; as it becomes primary, it writes the table the
+        // operations of its history the table may not hold, the rebuild's
+        // creates among them. (A replay after a node is killed is not covered
+        // here: a REST test cannot kill the node.)
+        long logMark = Files.size(serverLog());
+        failPrimary("emr8");
+        assertEquals("and through its history", before, rowIds("emr8"));
+
+        // Closing flushes: the reopened index replays nothing and writes the
+        // table from its history alone.
+        call("POST", "/emr8/_close", null);
+        call("POST", "/emr8/_open?wait_for_active_shards=1", null);
+        call("GET", "/_cluster/health/emr8?wait_for_status=green&timeout=60s", null);
+        assertEquals("and through the index's reopening", before, rowIds("emr8"));
+        assertEquals(KEPT_ROWS, ((Number) call("GET", "/emr8/_count", null).get("count")).intValue());
+        // The rows stay as they are either way, since the table refuses a
+        // source that opens with the mark; what the history skips is sending
+        // them: it writes none, and the table refuses none.
+        assertNoRebuiltRowSentFromHistory(logMark, KEPT_TABLE);
+
+        ResponseException forged = expectThrows(
+            ResponseException.class,
+            () -> call("PUT", "/emr8/_doc/forged?refresh=true", "{" + MARK + "\"n\":1}")
+        );
+        assertEquals(400, forged.getResponse().getStatusLine().getStatusCode());
+        assertEquals(KEPT_ROWS, rowIds("emr8").size());
+        call("DELETE", "/emr8", null);
+    }
+
+    /**
+     * An index with a final pipeline: a rebuild's creates run no pipeline,
+     * the final one included, because the table's rows went through it when
+     * they were written. Run again, it would apply twice, and write each
+     * create's source anew, which drops the mark the replay and the history
+     * look for.
+     */
+    @SuppressWarnings("unchecked")
+    public void testARebuildRunsNoFinalPipeline() throws Exception {
+        call("PUT", "/_ingest/pipeline/" + FINAL_PIPELINE, "{\"processors\":[{\"append\":{\"field\":\"seen\",\"value\":[\"final\"]}}]}");
+        String withPipeline = ",\"index.final_pipeline\":\"" + FINAL_PIPELINE + "\"";
+        createIndex("emr9_old", false, PIPELINE_TABLE, 1, withPipeline);
+        StringBuilder bulk = new StringBuilder();
+        for (int i = 0; i < PIPELINE_ROWS; i++) {
+            bulk.append("{\"index\":{\"_index\":\"emr9_old\",\"_id\":\"p").append(i).append("\"}}\n");
+            bulk.append("{\"n\":").append(i).append("}\n");
+        }
+        assertEquals(false, call("POST", "/_bulk?refresh=true", bulk.toString()).get("errors"));
+        Map<String, Object> before = rowIds("emr9_old");
+        assertEquals(PIPELINE_ROWS, before.size());
+        assertEquals(List.of("final"), ((Map<String, Object>) call("GET", "/emr9_old/_doc/p0", null).get("_source")).get("seen"));
+        call("DELETE", "/emr9_old", null);
+
+        createIndex("emr9", true, PIPELINE_TABLE, 1, withPipeline);
+        assertBusy(() -> {
+            Map<String, Object> index = (Map<String, Object>) callList("GET", "/_cat/indices/emr9?format=json&h=docs.count", null).get(0);
+            assertEquals(String.valueOf(PIPELINE_ROWS), index.get("docs.count"));
+        }, REBUILD_SECONDS, TimeUnit.SECONDS);
+        assertEquals("every row keeps its engine id through the rebuild", before, rowIds("emr9"));
+        assertEquals("the pipeline ran once", List.of("final"), ((Map<String, Object>) call("GET", "/emr9/_doc/p0", null).get("_source")).get("seen"));
+        failPrimary("emr9");
+        assertEquals("and through its history", before, rowIds("emr9"));
+        call("DELETE", "/emr9", null);
+        call("DELETE", "/_ingest/pipeline/" + FINAL_PIPELINE, null);
+    }
+
+    /**
+     * The test node's log says, since byte {@code from}, that no operation of
+     * a shard's history was written to {@code table} on a restart or a
+     * reopening, and that the table refused none: a rebuild's creates are
+     * left out, since the table holds their rows.
+     */
+    private void assertNoRebuiltRowSentFromHistory(long from, String table) throws IOException {
+        String since;
+        try (SeekableByteChannel log = Files.newByteChannel(serverLog())) {
+            log.position(from);
+            since = new String(Channels.newInputStream(log).readAllBytes(), StandardCharsets.UTF_8);
+        }
+        Matcher written = Pattern.compile("wrote (\\d+) operations of its history from \\d+ to \\d+ into " + table + "\\b").matcher(since);
+        while (written.find()) {
+            assertEquals("operations of the history written to " + table + ": " + written.group(), "0", written.group(1));
+        }
+        for (String line : since.split("\n")) {
+            assertFalse("the table refused a replayed row: " + line, line.contains("table " + table + " refuses document"));
+        }
+    }
+
+    /** The test node's log, as the build names it. */
+    private static Path serverLog() {
+        String log = System.getProperty(SERVER_LOG);
+        assertNotNull(SERVER_LOG + " names the test node's log", log);
+        return Path.of(log);
+    }
+
+    /** Fail {@code index}'s one primary and wait until it is allocated again from its own store. */
+    @SuppressWarnings("unchecked")
+    private void failPrimary(String index) throws IOException {
+        List<Object> shard = callList("GET", "/_cat/shards/" + index + "?format=json&h=node", null);
+        String node = ((Map<String, Object>) shard.get(0)).get("node").toString();
+        call(
+            "POST",
+            "/_cluster/reroute",
+            "{\"commands\":[{\"cancel\":{\"index\":\"" + index + "\",\"shard\":0,\"node\":\"" + node + "\",\"allow_primary\":true}}]}"
+        );
+        call("GET", "/_cluster/health/" + index + "?wait_for_status=green&timeout=60s", null);
+    }
+
     /** The hits of a search of the held-rebuild test's index, room left for every row. */
     @SuppressWarnings("unchecked")
     private List<?> heldHits() throws IOException {
@@ -177,6 +336,11 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
     }
 
     private void createIndex(String index, boolean rebuilt, String table, int shards) throws IOException {
+        createIndex(index, rebuilt, table, shards, "");
+    }
+
+    /** {@code settings} adds index settings, each led by a comma. */
+    private void createIndex(String index, boolean rebuilt, String table, int shards, String settings) throws IOException {
         call(
             "PUT",
             "/" + index,
@@ -186,7 +350,9 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
                 + rebuilt
                 + ",\"number_of_shards\":"
                 + shards
-                + ",\"number_of_replicas\":0},"
+                + ",\"number_of_replicas\":0"
+                + settings
+                + "},"
                 + "\"mappings\":{\"properties\":{\"n\":{\"type\":\"long\"}}}}"
         );
     }
