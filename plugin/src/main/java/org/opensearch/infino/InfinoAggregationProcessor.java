@@ -1702,7 +1702,13 @@ public class InfinoAggregationProcessor {
         BOOL,
         LONG,
         DOUBLE,
-        DATE
+        DATE,
+        /**
+         * An ip field's address, as the table holds it: grouped by its text,
+         * ordered by its key ({@link InfinoIp#key}) and bucketed by its
+         * 16-byte form, as stock orders and prints addresses.
+         */
+        IP
     }
 
     /** How a date histogram keys its buckets. */
@@ -1781,9 +1787,13 @@ public class InfinoAggregationProcessor {
             if (t.size() > MAX_TERMS_SIZE) {
                 throw new Unsupported("aggregation [" + t.getName() + "] asks for " + t.size() + " buckets; at most " + MAX_TERMS_SIZE + " are served");
             }
-            KeyKind kind = kindOf(c);
+            KeyKind kind = ipField(t, cols) && !c.masked() ? KeyKind.IP : kindOf(c);
             if (c.masked() && kind != KeyKind.STR && kind != KeyKind.BOOL) {
                 throw masked(t, c); // a numeric or date key would be the value itself
+            }
+            if (kind == KeyKind.IP && t.missing() != null) {
+                // The stand-in is ordered as an address, so it must be one; refused with stock's message.
+                InfinoIp.keyOf(t.missing());
             }
             String order = orderClause(t.order(), leaves.metrics());
             if (order == null) {
@@ -2134,9 +2144,18 @@ public class InfinoAggregationProcessor {
             };
         }
 
-        /** ORDER BY for this level's buckets, {@code keyAlias} standing in for its key. */
+        /** ORDER BY for this level's buckets, {@code keyAlias} standing in for its key: an address by its key. */
         String order(String keyAlias) {
-            return orderTemplate.replace("{key}", keyAlias);
+            return orderTemplate.replace("{key}", keyKind == KeyKind.IP ? InfinoIp.key(keyAlias) : keyAlias);
+        }
+
+        /** Whether the aggregation reads an ip field itself, not through a script. */
+        static boolean ipField(ValuesSourceAggregationBuilder<?> b, Map<String, Column> cols) {
+            if (b.field() == null || b.script() != null) {
+                return false;
+            }
+            Column c = InfinoSearch.columnFor(cols, b.field());
+            return c != null && InfinoQueryTranslator.isIp(c);
         }
 
         /**
@@ -2195,7 +2214,7 @@ public class InfinoAggregationProcessor {
         /** A key of {@code kind}, as a row returned it, as an SQL literal. */
         static String keyLiteral(KeyKind kind, Object key) {
             return switch (kind) {
-                case STR -> literal(key.toString());
+                case STR, IP -> literal(key.toString());
                 case BOOL -> String.valueOf(asBoolean(key));
                 case LONG -> Long.toString(asLong(key));
                 case DOUBLE -> Double.toString(asDouble(key, 0.0));
@@ -2242,6 +2261,7 @@ public class InfinoAggregationProcessor {
                 }
                 switch (keyKind) {
                     case STR, BOOL -> sBuckets.add(new StringTerms.Bucket(new BytesRef(source.shown(key)), docCount, subs, false, 0L, DocValueFormat.RAW));
+                    case IP -> sBuckets.add(new StringTerms.Bucket(InfinoIp.encoded(key), docCount, subs, false, 0L, DocValueFormat.IP));
                     case LONG, DATE -> lBuckets.add(new LongTerms.Bucket(asLong(key), docCount, subs, false, 0L, DocValueFormat.RAW));
                     case DOUBLE -> dBuckets.add(new InfinoAggregationWire.DoubleBucket(asDouble(key, 0.0), docCount, subs));
                 }
@@ -2266,6 +2286,8 @@ public class InfinoAggregationProcessor {
             }
             return switch (keyKind) {
                 case STR, BOOL -> new StringTerms(t.getName(), t.order(), t.order(), metadataOf(t), DocValueFormat.RAW, size, false, otherDocCount, sBuckets, 0L, thresholds);
+                // As stock buckets an ip field: by the 16-byte form, which the reduce orders and the format prints.
+                case IP -> new StringTerms(t.getName(), t.order(), t.order(), metadataOf(t), DocValueFormat.IP, size, false, otherDocCount, sBuckets, 0L, thresholds);
                 case LONG, DATE -> new LongTerms(t.getName(), t.order(), t.order(), metadataOf(t), DocValueFormat.RAW, size, false, otherDocCount, lBuckets, 0L, thresholds);
                 // The double bucket class is not public in every release built against; the object comes through its stream form.
                 case DOUBLE -> InfinoAggregationWire.doubleTerms(t.getName(), metadataOf(t), t.order(), t.size(), size, t.minDocCount(), otherDocCount, dBuckets);
@@ -2847,6 +2869,10 @@ public class InfinoAggregationProcessor {
                 );
             }
             if (s instanceof TermsValuesSourceBuilder) {
+                if (column != null && s.script() == null && InfinoQueryTranslator.isIp(column)) {
+                    // Its pages run in the after key's order, which for an address is not its text's.
+                    throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] on the ip field " + c.label() + " is not served");
+                }
                 KeyKind kind = Grouped.kindOf(c);
                 DocValueFormat format = kind == KeyKind.DATE
                     ? Grouped.dateFormat(s.format(), c, ZoneOffset.UTC)
@@ -2964,7 +2990,7 @@ public class InfinoAggregationProcessor {
                     continue;
                 }
                 key[i] = switch (sources.get(i).keyKind()) {
-                    case STR -> new BytesRef(v.toString());
+                    case STR, IP -> new BytesRef(v.toString()); // no composite source keys an address
                     case BOOL -> asBoolean(v) ? 1L : 0L;
                     case LONG, DATE -> asLong(v);
                     case DOUBLE -> asDouble(v, 0.0);
@@ -4621,6 +4647,7 @@ public class InfinoAggregationProcessor {
         }
         Comparable<?> out = switch (kind) {
             case STR -> new BytesRef(key.toString());
+            case IP -> InfinoIp.encoded(key);
             case BOOL -> asBoolean(key);
             case LONG, DATE -> asLong(key);
             case DOUBLE -> asDouble(key, 0.0);
@@ -4632,6 +4659,7 @@ public class InfinoAggregationProcessor {
     private static int compareKeys(KeyKind kind, Object a, Object b) {
         return switch (kind) {
             case STR -> new BytesRef(a.toString()).compareTo(new BytesRef(b.toString()));
+            case IP -> InfinoIp.encoded(a).compareTo(InfinoIp.encoded(b));
             case BOOL -> Boolean.compare(asBoolean(a), asBoolean(b));
             case LONG, DATE -> Long.compare(asLong(a), asLong(b));
             case DOUBLE -> Double.compare(asDouble(a, 0.0), asDouble(b, 0.0));

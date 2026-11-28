@@ -262,6 +262,8 @@ A `nested` query (Dashboards' `has_reference` on saved objects' `references` is 
 - **Where `knn` goes.** `knn` is the whole query, not a clause inside `bool`.
 - **Refused, with the parameter named:** radial search (`max_distance`, `min_score`), `method_parameters`, `rescore`, `expand_nested_docs`, `ignore_unmapped`, a boost or query name. With a `knn` query, aggregations, field sorts, `post_filter`, `collapse`, `search_after` and scroll are refused too.
 
+**IP fields:** a `range`, a sort and a `terms` key order on an `ip` field compare addresses as stock does: as numbers, an IPv4 address as its IPv4-mapped IPv6 address, and a hit or bucket shows the address as stock prints it. A `term` and a `terms` bucket still match an address by the text the document wrote, so `::ffff:10.1.2.3` and `10.1.2.3` are two values there. Three shapes are refused with a 400: a sort on an `ip` field that some documents give several values, a `missing` address on such a sort (`_first` and `_last` are served), and a `composite` source on an `ip` field.
+
 **Not supported:** HDR percentiles; `fuzzy`, `function_score` and geo queries; `suggest`; sliced search (sliced scroll, reindex or update by query); and a search across Infino-backed and other indices together. A request using any of these fails with a 400 that names the clause (`[infino] query not served by the table: ...`); it does not return an empty answer instead.
 
 ## Writes

@@ -2107,6 +2107,16 @@ final class InfinoQueryTranslator {
         if (v == null) {
             return false;
         }
+        if (isIp(c)) {
+            // An address by its key, as the statement compares it; text that is not one is in no range.
+            String x;
+            try {
+                x = InfinoIp.keyOf(v);
+            } catch (IllegalArgumentException e) {
+                return false;
+            }
+            return within(r, b -> x.compareTo(InfinoIp.keyOf(b)));
+        }
         if (c.isString()) {
             byte[] x = v.toString().getBytes(StandardCharsets.UTF_8);
             return within(r, b -> Arrays.compareUnsigned(x, b.toString().getBytes(StandardCharsets.UTF_8)));
@@ -2170,8 +2180,13 @@ final class InfinoQueryTranslator {
 
     /** Whether {@code value}, in a term on {@code c}, is a CIDR block: on an ip field, text with a prefix length. */
     private static boolean isCidr(Column c, Object value) {
+        return isIp(c) && value != null && value.toString().indexOf('/') >= 0;
+    }
+
+    /** Whether {@code c} is an ip field's column (its element, for a list). */
+    static boolean isIp(Column c) {
         InfinoNative.FieldType type = c.element().fieldType();
-        return type != null && type.isIp() && value != null && value.toString().indexOf('/') >= 0;
+        return type != null && type.isIp();
     }
 
     /**
@@ -3438,6 +3453,9 @@ final class InfinoQueryTranslator {
         if (!(typed.isNumeric() || typed.isTimestamp() || typed.isString())) {
             return null;
         }
+        if (isIp(typed)) {
+            return ipRange(c, r);
+        }
         // Each bound as a comparison and its literal, applied to whichever values the field has.
         List<String> bounds = new ArrayList<>();
         ZoneId zone = r.timeZone() == null ? null : ZoneId.of(r.timeZone());
@@ -3508,6 +3526,29 @@ final class InfinoQueryTranslator {
             }
             return "(" + String.join(" AND ", parts) + ")";
         });
+    }
+
+    /**
+     * A range on an ip field: each address compared by its key
+     * ({@link InfinoIp#key}), in the order stock compares addresses, not as
+     * text. Each bound is the address it admits inclusive, as stock reads
+     * it (past {@code 10.0.0.0} is from {@code 10.0.0.1}), so the key is
+     * computed once per value. A bound that is not an address is refused
+     * with stock's message.
+     */
+    private String ipRange(Column c, RangeQueryBuilder r) {
+        String lower = r.from() == null ? null : InfinoIp.lowerKey(r.from(), r.includeLower());
+        String upper = r.to() == null ? null : InfinoIp.upperKey(r.to(), r.includeUpper());
+        if ((r.from() != null && lower == null) || (r.to() != null && upper == null)) {
+            return NONE; // past the greatest address, or before the least
+        }
+        if (lower == null && upper == null) {
+            return ALL;
+        }
+        String test = lower == null ? " <= '" + upper + "'"
+            : upper == null ? " >= '" + lower + "'"
+            : " BETWEEN '" + lower + "' AND '" + upper + "'";
+        return anyValue(c, v -> "(" + InfinoIp.key(v) + test + ")");
     }
 
     /** The epoch milliseconds of a bound {@link #range} wrote: a comparison and a quoted ISO instant. */

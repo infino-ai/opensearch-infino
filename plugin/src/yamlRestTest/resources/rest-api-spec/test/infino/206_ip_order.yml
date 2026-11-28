@@ -1,0 +1,1496 @@
+# An ip field's addresses are ordered as numbers, by their 16-byte form (an
+# IPv4 address as its IPv4-mapped IPv6 address), not as the text the table
+# holds: as text, 1.0.179.100 sorts before 1.0.6.192 and 100.0.0.0 lies
+# between 10.0.0.0 and 10.255.255.255. Each answer is checked against a
+# Lucene twin, in default and proxy mode.
+"An ip field is ordered by address in ranges, sorts and terms keys, as a Lucene twin orders it":
+  - do:
+      indices.create:
+        index: ipo_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              addr: { type: ip }
+              n: { type: long }
+  - do:
+      indices.create:
+        index: ipo_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              addr: { type: ip }
+              n: { type: long }
+  - do:
+      indices.create:
+        index: ipo_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              addr: { type: ip }
+              n: { type: long }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: ipo_luc
+        body:
+          - index: { _id: "a1" }
+          - {n: 0, addr: "1.0.179.100"}
+          - index: { _id: "a2" }
+          - {n: 1, addr: "1.0.207.111"}
+          - index: { _id: "a3" }
+          - {n: 2, addr: "1.0.6.192"}
+          - index: { _id: "a4" }
+          - {n: 3, addr: "1.0.61.206"}
+          - index: { _id: "a5" }
+          - {n: 4, addr: "10.0.0.0"}
+          - index: { _id: "a6" }
+          - {n: 5, addr: "10.255.255.255"}
+          - index: { _id: "a7" }
+          - {n: 6, addr: "100.0.0.0"}
+          - index: { _id: "a8" }
+          - {n: 7, addr: "100.0.0.1"}
+          - index: { _id: "a9" }
+          - {n: 8, addr: "9.255.255.255"}
+          - index: { _id: "a10" }
+          - {n: 9, addr: "::1"}
+          - index: { _id: "a11" }
+          - {n: 10, addr: "2001:db8::1"}
+          - index: { _id: "a12" }
+          - {n: 11, addr: "2001:DB8:0:0:0:0:0:2"}
+          - index: { _id: "a13" }
+          - {n: 12, addr: "::ffff:10.1.2.3"}
+          - index: { _id: "a14" }
+          - {n: 13, addr: "255.255.255.255"}
+          - index: { _id: "a15" }
+          - {n: 14}
+          - index: { _id: "a16" }
+          - {n: 15, addr: "3.3.3.3"}
+          - index: { _id: "a17" }
+          - {n: 16, addr: "fe80::1"}
+          - index: { _id: "a18" }
+          - {n: 17, addr: "10.0.0.0"}
+  - match: { errors: false }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: ipo_def
+        body:
+          - index: { _id: "a1" }
+          - {n: 0, addr: "1.0.179.100"}
+          - index: { _id: "a2" }
+          - {n: 1, addr: "1.0.207.111"}
+          - index: { _id: "a3" }
+          - {n: 2, addr: "1.0.6.192"}
+          - index: { _id: "a4" }
+          - {n: 3, addr: "1.0.61.206"}
+          - index: { _id: "a5" }
+          - {n: 4, addr: "10.0.0.0"}
+          - index: { _id: "a6" }
+          - {n: 5, addr: "10.255.255.255"}
+          - index: { _id: "a7" }
+          - {n: 6, addr: "100.0.0.0"}
+          - index: { _id: "a8" }
+          - {n: 7, addr: "100.0.0.1"}
+          - index: { _id: "a9" }
+          - {n: 8, addr: "9.255.255.255"}
+          - index: { _id: "a10" }
+          - {n: 9, addr: "::1"}
+          - index: { _id: "a11" }
+          - {n: 10, addr: "2001:db8::1"}
+          - index: { _id: "a12" }
+          - {n: 11, addr: "2001:DB8:0:0:0:0:0:2"}
+          - index: { _id: "a13" }
+          - {n: 12, addr: "::ffff:10.1.2.3"}
+          - index: { _id: "a14" }
+          - {n: 13, addr: "255.255.255.255"}
+          - index: { _id: "a15" }
+          - {n: 14}
+          - index: { _id: "a16" }
+          - {n: 15, addr: "3.3.3.3"}
+          - index: { _id: "a17" }
+          - {n: 16, addr: "fe80::1"}
+          - index: { _id: "a18" }
+          - {n: 17, addr: "10.0.0.0"}
+  - match: { errors: false }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: ipo_prx
+        body:
+          - index: { _id: "a1" }
+          - {n: 0, addr: "1.0.179.100"}
+          - index: { _id: "a2" }
+          - {n: 1, addr: "1.0.207.111"}
+          - index: { _id: "a3" }
+          - {n: 2, addr: "1.0.6.192"}
+          - index: { _id: "a4" }
+          - {n: 3, addr: "1.0.61.206"}
+          - index: { _id: "a5" }
+          - {n: 4, addr: "10.0.0.0"}
+          - index: { _id: "a6" }
+          - {n: 5, addr: "10.255.255.255"}
+          - index: { _id: "a7" }
+          - {n: 6, addr: "100.0.0.0"}
+          - index: { _id: "a8" }
+          - {n: 7, addr: "100.0.0.1"}
+          - index: { _id: "a9" }
+          - {n: 8, addr: "9.255.255.255"}
+          - index: { _id: "a10" }
+          - {n: 9, addr: "::1"}
+          - index: { _id: "a11" }
+          - {n: 10, addr: "2001:db8::1"}
+          - index: { _id: "a12" }
+          - {n: 11, addr: "2001:DB8:0:0:0:0:0:2"}
+          - index: { _id: "a13" }
+          - {n: 12, addr: "::ffff:10.1.2.3"}
+          - index: { _id: "a14" }
+          - {n: 13, addr: "255.255.255.255"}
+          - index: { _id: "a15" }
+          - {n: 14}
+          - index: { _id: "a16" }
+          - {n: 15, addr: "3.3.3.3"}
+          - index: { _id: "a17" }
+          - {n: 16, addr: "fe80::1"}
+          - index: { _id: "a18" }
+          - {n: 17, addr: "10.0.0.0"}
+  - match: { errors: false }
+  # A range on an ip field keeps the addresses in it as numbers.
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "10.0.0.0", lte: "10.255.255.255" } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "10.0.0.0", lte: "10.255.255.255" } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "10.0.0.0", lte: "10.255.255.255" } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "100.0.0.0" } } } }
+  - match: { hits.total.value: 5 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "100.0.0.0" } } } }
+  - match: { hits.total.value: 5 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "100.0.0.0" } } } }
+  - match: { hits.total.value: 5 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { lt: "100.0.0.0" } } } }
+  - match: { hits.total.value: 11 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { lt: "100.0.0.0" } } } }
+  - match: { hits.total.value: 11 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { lt: "100.0.0.0" } } } }
+  - match: { hits.total.value: 11 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::1", lt: "::ffff:0.0.0.0" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::1", lt: "::ffff:0.0.0.0" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::1", lt: "::ffff:0.0.0.0" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "2001:db8::", lte: "2001:db8::ffff" } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "2001:db8::", lte: "2001:db8::ffff" } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "2001:db8::", lte: "2001:db8::ffff" } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "255.255.255.255" } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "255.255.255.255" } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "255.255.255.255" } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "1.0.6.192", lte: "1.0.61.206" } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "1.0.6.192", lte: "1.0.61.206" } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "1.0.6.192", lte: "1.0.61.206" } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, track_total_hits: true, query: { query_string: { query: "addr:[10.0.0.0 TO 10.255.255.255]" } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, track_total_hits: true, query: { query_string: { query: "addr:[10.0.0.0 TO 10.255.255.255]" } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, track_total_hits: true, query: { query_string: { query: "addr:[10.0.0.0 TO 10.255.255.255]" } } }
+  - match: { hits.total.value: 4 }
+
+  # A range across the IPv4-mapped block's edge, one with an IPv4 and an IPv6 bound, and bounds in mapped form.
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::1", lte: "::ffff:1.0.255.255" } } } }
+  - match: { hits.total.value: 5 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::1", lte: "::ffff:1.0.255.255" } } } }
+  - match: { hits.total.value: 5 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::1", lte: "::ffff:1.0.255.255" } } } }
+  - match: { hits.total.value: 5 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "::", lte: "::ffff:3.3.3.3" } } } }
+  - match: { hits.total.value: 6 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "::", lte: "::ffff:3.3.3.3" } } } }
+  - match: { hits.total.value: 6 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "::", lte: "::ffff:3.3.3.3" } } } }
+  - match: { hits.total.value: 6 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "::ffff:255.255.255.255", lt: "2001:db8::2" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "::ffff:255.255.255.255", lt: "2001:db8::2" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "::ffff:255.255.255.255", lt: "2001:db8::2" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "200.0.0.0", lt: "fe80::" } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "200.0.0.0", lt: "fe80::" } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "200.0.0.0", lt: "fe80::" } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::ffff:10.0.0.0", lte: "::ffff:10.255.255.255" } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::ffff:10.0.0.0", lte: "::ffff:10.255.255.255" } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::ffff:10.0.0.0", lte: "::ffff:10.255.255.255" } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { lte: "1.0.61.206" } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { lte: "1.0.61.206" } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { lte: "1.0.61.206" } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "2001:db8::2" } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "2001:db8::2" } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "2001:db8::2" } } } }
+  - match: { hits.total.value: 2 }
+
+  # A sort on an ip field orders the addresses as numbers and pages on with search_after.
+  - do:
+      search:
+        index: ipo_luc
+        body:
+          size: 6
+          sort: [ { addr: asc }, { n: asc } ]
+          _source: false
+  - length: { hits.hits: 6 }
+  - set: { hits.hits.0._id: asc_0_0_id }
+  - set: { hits.hits.0.sort.0: asc_0_0_v }
+  - set: { hits.hits.1._id: asc_0_1_id }
+  - set: { hits.hits.1.sort.0: asc_0_1_v }
+  - set: { hits.hits.2._id: asc_0_2_id }
+  - set: { hits.hits.2.sort.0: asc_0_2_v }
+  - set: { hits.hits.3._id: asc_0_3_id }
+  - set: { hits.hits.3.sort.0: asc_0_3_v }
+  - set: { hits.hits.4._id: asc_0_4_id }
+  - set: { hits.hits.4.sort.0: asc_0_4_v }
+  - set: { hits.hits.5._id: asc_0_5_id }
+  - set: { hits.hits.5.sort.0: asc_0_5_v }
+  - set: { hits.hits.5.sort: after_asc_luc_0 }
+  - do:
+      search:
+        index: ipo_luc
+        body:
+          size: 6
+          sort: [ { addr: asc }, { n: asc } ]
+          _source: false
+          search_after: $after_asc_luc_0
+  - length: { hits.hits: 6 }
+  - set: { hits.hits.0._id: asc_1_0_id }
+  - set: { hits.hits.0.sort.0: asc_1_0_v }
+  - set: { hits.hits.1._id: asc_1_1_id }
+  - set: { hits.hits.1.sort.0: asc_1_1_v }
+  - set: { hits.hits.2._id: asc_1_2_id }
+  - set: { hits.hits.2.sort.0: asc_1_2_v }
+  - set: { hits.hits.3._id: asc_1_3_id }
+  - set: { hits.hits.3.sort.0: asc_1_3_v }
+  - set: { hits.hits.4._id: asc_1_4_id }
+  - set: { hits.hits.4.sort.0: asc_1_4_v }
+  - set: { hits.hits.5._id: asc_1_5_id }
+  - set: { hits.hits.5.sort.0: asc_1_5_v }
+  - set: { hits.hits.5.sort: after_asc_luc_1 }
+  - do:
+      search:
+        index: ipo_def
+        body:
+          size: 6
+          sort: [ { addr: asc }, { n: asc } ]
+          _source: false
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: $asc_0_0_id }
+  - match: { hits.hits.0.sort.0: $asc_0_0_v }
+  - match: { hits.hits.1._id: $asc_0_1_id }
+  - match: { hits.hits.1.sort.0: $asc_0_1_v }
+  - match: { hits.hits.2._id: $asc_0_2_id }
+  - match: { hits.hits.2.sort.0: $asc_0_2_v }
+  - match: { hits.hits.3._id: $asc_0_3_id }
+  - match: { hits.hits.3.sort.0: $asc_0_3_v }
+  - match: { hits.hits.4._id: $asc_0_4_id }
+  - match: { hits.hits.4.sort.0: $asc_0_4_v }
+  - match: { hits.hits.5._id: $asc_0_5_id }
+  - match: { hits.hits.5.sort.0: $asc_0_5_v }
+  - set: { hits.hits.5.sort: after_asc_def_0 }
+  - do:
+      search:
+        index: ipo_def
+        body:
+          size: 6
+          sort: [ { addr: asc }, { n: asc } ]
+          _source: false
+          search_after: $after_asc_def_0
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: $asc_1_0_id }
+  - match: { hits.hits.0.sort.0: $asc_1_0_v }
+  - match: { hits.hits.1._id: $asc_1_1_id }
+  - match: { hits.hits.1.sort.0: $asc_1_1_v }
+  - match: { hits.hits.2._id: $asc_1_2_id }
+  - match: { hits.hits.2.sort.0: $asc_1_2_v }
+  - match: { hits.hits.3._id: $asc_1_3_id }
+  - match: { hits.hits.3.sort.0: $asc_1_3_v }
+  - match: { hits.hits.4._id: $asc_1_4_id }
+  - match: { hits.hits.4.sort.0: $asc_1_4_v }
+  - match: { hits.hits.5._id: $asc_1_5_id }
+  - match: { hits.hits.5.sort.0: $asc_1_5_v }
+  - set: { hits.hits.5.sort: after_asc_def_1 }
+  - do:
+      search:
+        index: ipo_prx
+        body:
+          size: 6
+          sort: [ { addr: asc }, { n: asc } ]
+          _source: false
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: $asc_0_0_id }
+  - match: { hits.hits.0.sort.0: $asc_0_0_v }
+  - match: { hits.hits.1._id: $asc_0_1_id }
+  - match: { hits.hits.1.sort.0: $asc_0_1_v }
+  - match: { hits.hits.2._id: $asc_0_2_id }
+  - match: { hits.hits.2.sort.0: $asc_0_2_v }
+  - match: { hits.hits.3._id: $asc_0_3_id }
+  - match: { hits.hits.3.sort.0: $asc_0_3_v }
+  - match: { hits.hits.4._id: $asc_0_4_id }
+  - match: { hits.hits.4.sort.0: $asc_0_4_v }
+  - match: { hits.hits.5._id: $asc_0_5_id }
+  - match: { hits.hits.5.sort.0: $asc_0_5_v }
+  - set: { hits.hits.5.sort: after_asc_prx_0 }
+  - do:
+      search:
+        index: ipo_prx
+        body:
+          size: 6
+          sort: [ { addr: asc }, { n: asc } ]
+          _source: false
+          search_after: $after_asc_prx_0
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: $asc_1_0_id }
+  - match: { hits.hits.0.sort.0: $asc_1_0_v }
+  - match: { hits.hits.1._id: $asc_1_1_id }
+  - match: { hits.hits.1.sort.0: $asc_1_1_v }
+  - match: { hits.hits.2._id: $asc_1_2_id }
+  - match: { hits.hits.2.sort.0: $asc_1_2_v }
+  - match: { hits.hits.3._id: $asc_1_3_id }
+  - match: { hits.hits.3.sort.0: $asc_1_3_v }
+  - match: { hits.hits.4._id: $asc_1_4_id }
+  - match: { hits.hits.4.sort.0: $asc_1_4_v }
+  - match: { hits.hits.5._id: $asc_1_5_id }
+  - match: { hits.hits.5.sort.0: $asc_1_5_v }
+  - set: { hits.hits.5.sort: after_asc_prx_1 }
+  - do:
+      search:
+        index: ipo_luc
+        body:
+          size: 6
+          sort: [ { addr: desc }, { n: asc } ]
+          _source: false
+  - length: { hits.hits: 6 }
+  - set: { hits.hits.0._id: desc_0_0_id }
+  - set: { hits.hits.0.sort.0: desc_0_0_v }
+  - set: { hits.hits.1._id: desc_0_1_id }
+  - set: { hits.hits.1.sort.0: desc_0_1_v }
+  - set: { hits.hits.2._id: desc_0_2_id }
+  - set: { hits.hits.2.sort.0: desc_0_2_v }
+  - set: { hits.hits.3._id: desc_0_3_id }
+  - set: { hits.hits.3.sort.0: desc_0_3_v }
+  - set: { hits.hits.4._id: desc_0_4_id }
+  - set: { hits.hits.4.sort.0: desc_0_4_v }
+  - set: { hits.hits.5._id: desc_0_5_id }
+  - set: { hits.hits.5.sort.0: desc_0_5_v }
+  - set: { hits.hits.5.sort: after_desc_luc_0 }
+  - do:
+      search:
+        index: ipo_luc
+        body:
+          size: 6
+          sort: [ { addr: desc }, { n: asc } ]
+          _source: false
+          search_after: $after_desc_luc_0
+  - length: { hits.hits: 6 }
+  - set: { hits.hits.0._id: desc_1_0_id }
+  - set: { hits.hits.0.sort.0: desc_1_0_v }
+  - set: { hits.hits.1._id: desc_1_1_id }
+  - set: { hits.hits.1.sort.0: desc_1_1_v }
+  - set: { hits.hits.2._id: desc_1_2_id }
+  - set: { hits.hits.2.sort.0: desc_1_2_v }
+  - set: { hits.hits.3._id: desc_1_3_id }
+  - set: { hits.hits.3.sort.0: desc_1_3_v }
+  - set: { hits.hits.4._id: desc_1_4_id }
+  - set: { hits.hits.4.sort.0: desc_1_4_v }
+  - set: { hits.hits.5._id: desc_1_5_id }
+  - set: { hits.hits.5.sort.0: desc_1_5_v }
+  - set: { hits.hits.5.sort: after_desc_luc_1 }
+  - do:
+      search:
+        index: ipo_def
+        body:
+          size: 6
+          sort: [ { addr: desc }, { n: asc } ]
+          _source: false
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: $desc_0_0_id }
+  - match: { hits.hits.0.sort.0: $desc_0_0_v }
+  - match: { hits.hits.1._id: $desc_0_1_id }
+  - match: { hits.hits.1.sort.0: $desc_0_1_v }
+  - match: { hits.hits.2._id: $desc_0_2_id }
+  - match: { hits.hits.2.sort.0: $desc_0_2_v }
+  - match: { hits.hits.3._id: $desc_0_3_id }
+  - match: { hits.hits.3.sort.0: $desc_0_3_v }
+  - match: { hits.hits.4._id: $desc_0_4_id }
+  - match: { hits.hits.4.sort.0: $desc_0_4_v }
+  - match: { hits.hits.5._id: $desc_0_5_id }
+  - match: { hits.hits.5.sort.0: $desc_0_5_v }
+  - set: { hits.hits.5.sort: after_desc_def_0 }
+  - do:
+      search:
+        index: ipo_def
+        body:
+          size: 6
+          sort: [ { addr: desc }, { n: asc } ]
+          _source: false
+          search_after: $after_desc_def_0
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: $desc_1_0_id }
+  - match: { hits.hits.0.sort.0: $desc_1_0_v }
+  - match: { hits.hits.1._id: $desc_1_1_id }
+  - match: { hits.hits.1.sort.0: $desc_1_1_v }
+  - match: { hits.hits.2._id: $desc_1_2_id }
+  - match: { hits.hits.2.sort.0: $desc_1_2_v }
+  - match: { hits.hits.3._id: $desc_1_3_id }
+  - match: { hits.hits.3.sort.0: $desc_1_3_v }
+  - match: { hits.hits.4._id: $desc_1_4_id }
+  - match: { hits.hits.4.sort.0: $desc_1_4_v }
+  - match: { hits.hits.5._id: $desc_1_5_id }
+  - match: { hits.hits.5.sort.0: $desc_1_5_v }
+  - set: { hits.hits.5.sort: after_desc_def_1 }
+  - do:
+      search:
+        index: ipo_prx
+        body:
+          size: 6
+          sort: [ { addr: desc }, { n: asc } ]
+          _source: false
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: $desc_0_0_id }
+  - match: { hits.hits.0.sort.0: $desc_0_0_v }
+  - match: { hits.hits.1._id: $desc_0_1_id }
+  - match: { hits.hits.1.sort.0: $desc_0_1_v }
+  - match: { hits.hits.2._id: $desc_0_2_id }
+  - match: { hits.hits.2.sort.0: $desc_0_2_v }
+  - match: { hits.hits.3._id: $desc_0_3_id }
+  - match: { hits.hits.3.sort.0: $desc_0_3_v }
+  - match: { hits.hits.4._id: $desc_0_4_id }
+  - match: { hits.hits.4.sort.0: $desc_0_4_v }
+  - match: { hits.hits.5._id: $desc_0_5_id }
+  - match: { hits.hits.5.sort.0: $desc_0_5_v }
+  - set: { hits.hits.5.sort: after_desc_prx_0 }
+  - do:
+      search:
+        index: ipo_prx
+        body:
+          size: 6
+          sort: [ { addr: desc }, { n: asc } ]
+          _source: false
+          search_after: $after_desc_prx_0
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: $desc_1_0_id }
+  - match: { hits.hits.0.sort.0: $desc_1_0_v }
+  - match: { hits.hits.1._id: $desc_1_1_id }
+  - match: { hits.hits.1.sort.0: $desc_1_1_v }
+  - match: { hits.hits.2._id: $desc_1_2_id }
+  - match: { hits.hits.2.sort.0: $desc_1_2_v }
+  - match: { hits.hits.3._id: $desc_1_3_id }
+  - match: { hits.hits.3.sort.0: $desc_1_3_v }
+  - match: { hits.hits.4._id: $desc_1_4_id }
+  - match: { hits.hits.4.sort.0: $desc_1_4_v }
+  - match: { hits.hits.5._id: $desc_1_5_id }
+  - match: { hits.hits.5.sort.0: $desc_1_5_v }
+  - set: { hits.hits.5.sort: after_desc_prx_1 }
+  # The document with no address sorts first or last as asked, in either direction.
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 3, sort: [ { addr: { order: asc, missing: _first } }, { n: asc } ], _source: false }
+  - length: { hits.hits: 3 }
+  - set: { hits.hits.0._id: mfa_0_id }
+  - set: { hits.hits.1._id: mfa_1_id }
+  - set: { hits.hits.2._id: mfa_2_id }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 3, sort: [ { addr: { order: asc, missing: _first } }, { n: asc } ], _source: false }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: $mfa_0_id }
+  - match: { hits.hits.1._id: $mfa_1_id }
+  - match: { hits.hits.2._id: $mfa_2_id }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 3, sort: [ { addr: { order: asc, missing: _first } }, { n: asc } ], _source: false }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: $mfa_0_id }
+  - match: { hits.hits.1._id: $mfa_1_id }
+  - match: { hits.hits.2._id: $mfa_2_id }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 18, sort: [ { addr: asc }, { n: asc } ], _source: false }
+  - length: { hits.hits: 18 }
+  - set: { hits.hits.15._id: mla_15_id }
+  - set: { hits.hits.16._id: mla_16_id }
+  - set: { hits.hits.17._id: mla_17_id }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 18, sort: [ { addr: asc }, { n: asc } ], _source: false }
+  - length: { hits.hits: 18 }
+  - match: { hits.hits.15._id: $mla_15_id }
+  - match: { hits.hits.16._id: $mla_16_id }
+  - match: { hits.hits.17._id: $mla_17_id }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 18, sort: [ { addr: asc }, { n: asc } ], _source: false }
+  - length: { hits.hits: 18 }
+  - match: { hits.hits.15._id: $mla_15_id }
+  - match: { hits.hits.16._id: $mla_16_id }
+  - match: { hits.hits.17._id: $mla_17_id }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 3, sort: [ { addr: { order: desc, missing: _first } }, { n: asc } ], _source: false }
+  - length: { hits.hits: 3 }
+  - set: { hits.hits.0._id: mfd_0_id }
+  - set: { hits.hits.1._id: mfd_1_id }
+  - set: { hits.hits.2._id: mfd_2_id }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 3, sort: [ { addr: { order: desc, missing: _first } }, { n: asc } ], _source: false }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: $mfd_0_id }
+  - match: { hits.hits.1._id: $mfd_1_id }
+  - match: { hits.hits.2._id: $mfd_2_id }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 3, sort: [ { addr: { order: desc, missing: _first } }, { n: asc } ], _source: false }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: $mfd_0_id }
+  - match: { hits.hits.1._id: $mfd_1_id }
+  - match: { hits.hits.2._id: $mfd_2_id }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 18, sort: [ { addr: desc }, { n: asc } ], _source: false }
+  - length: { hits.hits: 18 }
+  - set: { hits.hits.15._id: mld_15_id }
+  - set: { hits.hits.16._id: mld_16_id }
+  - set: { hits.hits.17._id: mld_17_id }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 18, sort: [ { addr: desc }, { n: asc } ], _source: false }
+  - length: { hits.hits: 18 }
+  - match: { hits.hits.15._id: $mld_15_id }
+  - match: { hits.hits.16._id: $mld_16_id }
+  - match: { hits.hits.17._id: $mld_17_id }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 18, sort: [ { addr: desc }, { n: asc } ], _source: false }
+  - length: { hits.hits: 18 }
+  - match: { hits.hits.15._id: $mld_15_id }
+  - match: { hits.hits.16._id: $mld_16_id }
+  - match: { hits.hits.17._id: $mld_17_id }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 18, sort: [ { addr: desc }, { n: asc } ], _source: false }
+  - match: { hits.hits.8._id: a5 }
+  - match: { hits.hits.9._id: a18 }
+  - match: { hits.hits.16._id: a10 }
+  - match: { hits.hits.17._id: a15 }
+  # The issue's addresses in number order, and ::1 before every IPv4 address.
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 6, sort: [ { addr: asc }, { n: asc } ], _source: false }
+  - match: { hits.hits.0._id: a10 }
+  - match: { hits.hits.1._id: a3 }
+  - match: { hits.hits.2._id: a4 }
+  - match: { hits.hits.3._id: a1 }
+  - match: { hits.hits.4._id: a2 }
+  - match: { hits.hits.5._id: a16 }
+  - match: { hits.hits.1.sort.0: "1.0.6.192" }
+  - match: { hits.hits.3.sort.0: "1.0.179.100" }
+  # A mapped or upper-case address comes back as stock prints it.
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 2, sort: [ { addr: desc }, { n: asc } ], query: { ids: { values: [ a12, a13 ] } }, _source: false }
+  - match: { hits.hits.0.sort.0: "2001:db8::2" }
+  - match: { hits.hits.1.sort.0: "10.1.2.3" }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 2, sort: [ { addr: desc }, { n: asc } ], query: { ids: { values: [ a12, a13 ] } }, _source: false }
+  - match: { hits.hits.0.sort.0: "2001:db8::2" }
+  - match: { hits.hits.1.sort.0: "10.1.2.3" }
+
+  # A terms aggregation on an ip field orders its keys as numbers.
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 8, order: { _key: asc } } } } }
+  - length: { aggregations.t.buckets: 8 }
+  - set: { aggregations.t.buckets.0.key: key_asc_0_k }
+  - set: { aggregations.t.buckets.0.doc_count: key_asc_0_c }
+  - set: { aggregations.t.buckets.1.key: key_asc_1_k }
+  - set: { aggregations.t.buckets.1.doc_count: key_asc_1_c }
+  - set: { aggregations.t.buckets.2.key: key_asc_2_k }
+  - set: { aggregations.t.buckets.2.doc_count: key_asc_2_c }
+  - set: { aggregations.t.buckets.3.key: key_asc_3_k }
+  - set: { aggregations.t.buckets.3.doc_count: key_asc_3_c }
+  - set: { aggregations.t.buckets.4.key: key_asc_4_k }
+  - set: { aggregations.t.buckets.4.doc_count: key_asc_4_c }
+  - set: { aggregations.t.buckets.5.key: key_asc_5_k }
+  - set: { aggregations.t.buckets.5.doc_count: key_asc_5_c }
+  - set: { aggregations.t.buckets.6.key: key_asc_6_k }
+  - set: { aggregations.t.buckets.6.doc_count: key_asc_6_c }
+  - set: { aggregations.t.buckets.7.key: key_asc_7_k }
+  - set: { aggregations.t.buckets.7.doc_count: key_asc_7_c }
+  - set: { aggregations.t.sum_other_doc_count: key_asc_other }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 8, order: { _key: asc } } } } }
+  - length: { aggregations.t.buckets: 8 }
+  - match: { aggregations.t.buckets.0.key: $key_asc_0_k }
+  - match: { aggregations.t.buckets.0.doc_count: $key_asc_0_c }
+  - match: { aggregations.t.buckets.1.key: $key_asc_1_k }
+  - match: { aggregations.t.buckets.1.doc_count: $key_asc_1_c }
+  - match: { aggregations.t.buckets.2.key: $key_asc_2_k }
+  - match: { aggregations.t.buckets.2.doc_count: $key_asc_2_c }
+  - match: { aggregations.t.buckets.3.key: $key_asc_3_k }
+  - match: { aggregations.t.buckets.3.doc_count: $key_asc_3_c }
+  - match: { aggregations.t.buckets.4.key: $key_asc_4_k }
+  - match: { aggregations.t.buckets.4.doc_count: $key_asc_4_c }
+  - match: { aggregations.t.buckets.5.key: $key_asc_5_k }
+  - match: { aggregations.t.buckets.5.doc_count: $key_asc_5_c }
+  - match: { aggregations.t.buckets.6.key: $key_asc_6_k }
+  - match: { aggregations.t.buckets.6.doc_count: $key_asc_6_c }
+  - match: { aggregations.t.buckets.7.key: $key_asc_7_k }
+  - match: { aggregations.t.buckets.7.doc_count: $key_asc_7_c }
+  - match: { aggregations.t.sum_other_doc_count: $key_asc_other }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 8, order: { _key: asc } } } } }
+  - length: { aggregations.t.buckets: 8 }
+  - match: { aggregations.t.buckets.0.key: $key_asc_0_k }
+  - match: { aggregations.t.buckets.0.doc_count: $key_asc_0_c }
+  - match: { aggregations.t.buckets.1.key: $key_asc_1_k }
+  - match: { aggregations.t.buckets.1.doc_count: $key_asc_1_c }
+  - match: { aggregations.t.buckets.2.key: $key_asc_2_k }
+  - match: { aggregations.t.buckets.2.doc_count: $key_asc_2_c }
+  - match: { aggregations.t.buckets.3.key: $key_asc_3_k }
+  - match: { aggregations.t.buckets.3.doc_count: $key_asc_3_c }
+  - match: { aggregations.t.buckets.4.key: $key_asc_4_k }
+  - match: { aggregations.t.buckets.4.doc_count: $key_asc_4_c }
+  - match: { aggregations.t.buckets.5.key: $key_asc_5_k }
+  - match: { aggregations.t.buckets.5.doc_count: $key_asc_5_c }
+  - match: { aggregations.t.buckets.6.key: $key_asc_6_k }
+  - match: { aggregations.t.buckets.6.doc_count: $key_asc_6_c }
+  - match: { aggregations.t.buckets.7.key: $key_asc_7_k }
+  - match: { aggregations.t.buckets.7.doc_count: $key_asc_7_c }
+  - match: { aggregations.t.sum_other_doc_count: $key_asc_other }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 8, order: { _key: desc } } } } }
+  - length: { aggregations.t.buckets: 8 }
+  - set: { aggregations.t.buckets.0.key: key_desc_0_k }
+  - set: { aggregations.t.buckets.0.doc_count: key_desc_0_c }
+  - set: { aggregations.t.buckets.1.key: key_desc_1_k }
+  - set: { aggregations.t.buckets.1.doc_count: key_desc_1_c }
+  - set: { aggregations.t.buckets.2.key: key_desc_2_k }
+  - set: { aggregations.t.buckets.2.doc_count: key_desc_2_c }
+  - set: { aggregations.t.buckets.3.key: key_desc_3_k }
+  - set: { aggregations.t.buckets.3.doc_count: key_desc_3_c }
+  - set: { aggregations.t.buckets.4.key: key_desc_4_k }
+  - set: { aggregations.t.buckets.4.doc_count: key_desc_4_c }
+  - set: { aggregations.t.buckets.5.key: key_desc_5_k }
+  - set: { aggregations.t.buckets.5.doc_count: key_desc_5_c }
+  - set: { aggregations.t.buckets.6.key: key_desc_6_k }
+  - set: { aggregations.t.buckets.6.doc_count: key_desc_6_c }
+  - set: { aggregations.t.buckets.7.key: key_desc_7_k }
+  - set: { aggregations.t.buckets.7.doc_count: key_desc_7_c }
+  - set: { aggregations.t.sum_other_doc_count: key_desc_other }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 8, order: { _key: desc } } } } }
+  - length: { aggregations.t.buckets: 8 }
+  - match: { aggregations.t.buckets.0.key: $key_desc_0_k }
+  - match: { aggregations.t.buckets.0.doc_count: $key_desc_0_c }
+  - match: { aggregations.t.buckets.1.key: $key_desc_1_k }
+  - match: { aggregations.t.buckets.1.doc_count: $key_desc_1_c }
+  - match: { aggregations.t.buckets.2.key: $key_desc_2_k }
+  - match: { aggregations.t.buckets.2.doc_count: $key_desc_2_c }
+  - match: { aggregations.t.buckets.3.key: $key_desc_3_k }
+  - match: { aggregations.t.buckets.3.doc_count: $key_desc_3_c }
+  - match: { aggregations.t.buckets.4.key: $key_desc_4_k }
+  - match: { aggregations.t.buckets.4.doc_count: $key_desc_4_c }
+  - match: { aggregations.t.buckets.5.key: $key_desc_5_k }
+  - match: { aggregations.t.buckets.5.doc_count: $key_desc_5_c }
+  - match: { aggregations.t.buckets.6.key: $key_desc_6_k }
+  - match: { aggregations.t.buckets.6.doc_count: $key_desc_6_c }
+  - match: { aggregations.t.buckets.7.key: $key_desc_7_k }
+  - match: { aggregations.t.buckets.7.doc_count: $key_desc_7_c }
+  - match: { aggregations.t.sum_other_doc_count: $key_desc_other }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 8, order: { _key: desc } } } } }
+  - length: { aggregations.t.buckets: 8 }
+  - match: { aggregations.t.buckets.0.key: $key_desc_0_k }
+  - match: { aggregations.t.buckets.0.doc_count: $key_desc_0_c }
+  - match: { aggregations.t.buckets.1.key: $key_desc_1_k }
+  - match: { aggregations.t.buckets.1.doc_count: $key_desc_1_c }
+  - match: { aggregations.t.buckets.2.key: $key_desc_2_k }
+  - match: { aggregations.t.buckets.2.doc_count: $key_desc_2_c }
+  - match: { aggregations.t.buckets.3.key: $key_desc_3_k }
+  - match: { aggregations.t.buckets.3.doc_count: $key_desc_3_c }
+  - match: { aggregations.t.buckets.4.key: $key_desc_4_k }
+  - match: { aggregations.t.buckets.4.doc_count: $key_desc_4_c }
+  - match: { aggregations.t.buckets.5.key: $key_desc_5_k }
+  - match: { aggregations.t.buckets.5.doc_count: $key_desc_5_c }
+  - match: { aggregations.t.buckets.6.key: $key_desc_6_k }
+  - match: { aggregations.t.buckets.6.doc_count: $key_desc_6_c }
+  - match: { aggregations.t.buckets.7.key: $key_desc_7_k }
+  - match: { aggregations.t.buckets.7.doc_count: $key_desc_7_c }
+  - match: { aggregations.t.sum_other_doc_count: $key_desc_other }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 5 } } } }
+  - length: { aggregations.t.buckets: 5 }
+  - set: { aggregations.t.buckets.0.key: count_0_k }
+  - set: { aggregations.t.buckets.0.doc_count: count_0_c }
+  - set: { aggregations.t.buckets.1.key: count_1_k }
+  - set: { aggregations.t.buckets.1.doc_count: count_1_c }
+  - set: { aggregations.t.buckets.2.key: count_2_k }
+  - set: { aggregations.t.buckets.2.doc_count: count_2_c }
+  - set: { aggregations.t.buckets.3.key: count_3_k }
+  - set: { aggregations.t.buckets.3.doc_count: count_3_c }
+  - set: { aggregations.t.buckets.4.key: count_4_k }
+  - set: { aggregations.t.buckets.4.doc_count: count_4_c }
+  - set: { aggregations.t.sum_other_doc_count: count_other }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 5 } } } }
+  - length: { aggregations.t.buckets: 5 }
+  - match: { aggregations.t.buckets.0.key: $count_0_k }
+  - match: { aggregations.t.buckets.0.doc_count: $count_0_c }
+  - match: { aggregations.t.buckets.1.key: $count_1_k }
+  - match: { aggregations.t.buckets.1.doc_count: $count_1_c }
+  - match: { aggregations.t.buckets.2.key: $count_2_k }
+  - match: { aggregations.t.buckets.2.doc_count: $count_2_c }
+  - match: { aggregations.t.buckets.3.key: $count_3_k }
+  - match: { aggregations.t.buckets.3.doc_count: $count_3_c }
+  - match: { aggregations.t.buckets.4.key: $count_4_k }
+  - match: { aggregations.t.buckets.4.doc_count: $count_4_c }
+  - match: { aggregations.t.sum_other_doc_count: $count_other }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 5 } } } }
+  - length: { aggregations.t.buckets: 5 }
+  - match: { aggregations.t.buckets.0.key: $count_0_k }
+  - match: { aggregations.t.buckets.0.doc_count: $count_0_c }
+  - match: { aggregations.t.buckets.1.key: $count_1_k }
+  - match: { aggregations.t.buckets.1.doc_count: $count_1_c }
+  - match: { aggregations.t.buckets.2.key: $count_2_k }
+  - match: { aggregations.t.buckets.2.doc_count: $count_2_c }
+  - match: { aggregations.t.buckets.3.key: $count_3_k }
+  - match: { aggregations.t.buckets.3.doc_count: $count_3_c }
+  - match: { aggregations.t.buckets.4.key: $count_4_k }
+  - match: { aggregations.t.buckets.4.doc_count: $count_4_c }
+  - match: { aggregations.t.sum_other_doc_count: $count_other }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 4, order: { _key: asc } } } } }
+  - match: { aggregations.t.buckets.0.key: "::1" }
+  - match: { aggregations.t.buckets.1.key: "1.0.6.192" }
+  - match: { aggregations.t.buckets.2.key: "1.0.61.206" }
+  - match: { aggregations.t.buckets.3.key: "1.0.179.100" }
+
+  # The least and greatest address: a one-hit sort, a one-bucket key order and top_hits; min and max are refused as stock refuses them.
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 1, sort: [ { addr: asc } ], _source: false }
+  - match: { hits.hits.0.sort.0: "::1" }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 1, sort: [ { addr: desc } ], _source: false }
+  - match: { hits.hits.0.sort.0: "fe80::1" }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, aggs: { lo: { terms: { field: addr, size: 1, order: { _key: asc } } }, hi: { terms: { field: addr, size: 1, order: { _key: desc } } } } }
+  - match: { aggregations.lo.buckets.0.key: "::1" }
+  - match: { aggregations.hi.buckets.0.key: "fe80::1" }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, aggs: { top: { top_hits: { size: 2, sort: [ { addr: desc } ], _source: false } } } }
+  - match: { aggregations.top.hits.hits.0._id: a17 }
+  - match: { aggregations.top.hits.hits.1._id: a12 }
+  - match: { aggregations.top.hits.hits.1.sort.0: "2001:db8::2" }
+  - do:
+      catch: bad_request
+      search:
+        index: ipo_luc
+        body: { size: 0, aggs: { m: { min: { field: addr } } } }
+  - do:
+      catch: bad_request
+      search:
+        index: ipo_luc
+        body: { size: 0, aggs: { m: { max: { field: addr } } } }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 1, sort: [ { addr: asc } ], _source: false }
+  - match: { hits.hits.0.sort.0: "::1" }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 1, sort: [ { addr: desc } ], _source: false }
+  - match: { hits.hits.0.sort.0: "fe80::1" }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { lo: { terms: { field: addr, size: 1, order: { _key: asc } } }, hi: { terms: { field: addr, size: 1, order: { _key: desc } } } } }
+  - match: { aggregations.lo.buckets.0.key: "::1" }
+  - match: { aggregations.hi.buckets.0.key: "fe80::1" }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { top: { top_hits: { size: 2, sort: [ { addr: desc } ], _source: false } } } }
+  - match: { aggregations.top.hits.hits.0._id: a17 }
+  - match: { aggregations.top.hits.hits.1._id: a12 }
+  - match: { aggregations.top.hits.hits.1.sort.0: "2001:db8::2" }
+  - do:
+      catch: bad_request
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { m: { min: { field: addr } } } }
+  - do:
+      catch: bad_request
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { m: { max: { field: addr } } } }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 1, sort: [ { addr: asc } ], _source: false }
+  - match: { hits.hits.0.sort.0: "::1" }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 1, sort: [ { addr: desc } ], _source: false }
+  - match: { hits.hits.0.sort.0: "fe80::1" }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, aggs: { lo: { terms: { field: addr, size: 1, order: { _key: asc } } }, hi: { terms: { field: addr, size: 1, order: { _key: desc } } } } }
+  - match: { aggregations.lo.buckets.0.key: "::1" }
+  - match: { aggregations.hi.buckets.0.key: "fe80::1" }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, aggs: { top: { top_hits: { size: 2, sort: [ { addr: desc } ], _source: false } } } }
+  - match: { aggregations.top.hits.hits.0._id: a17 }
+  - match: { aggregations.top.hits.hits.1._id: a12 }
+  - match: { aggregations.top.hits.hits.1.sort.0: "2001:db8::2" }
+  - do:
+      catch: bad_request
+      search:
+        index: ipo_prx
+        body: { size: 0, aggs: { m: { min: { field: addr } } } }
+  - do:
+      catch: bad_request
+      search:
+        index: ipo_prx
+        body: { size: 0, aggs: { m: { max: { field: addr } } } }
+
+  # A composite source on an ip field is refused, since its pages would follow the text.
+  - do:
+      catch: bad_request
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { c: { composite: { sources: [ { a: { terms: { field: addr } } } ] } } } }
+  - match: { error.root_cause.0.reason: "/.*on.the.ip.field..addr..is.not.served.*/" }
+  # A missing value on an ip sort is refused: stock compares its text with the addresses' 16-byte form.
+  - do:
+      catch: bad_request
+      search:
+        index: ipo_def
+        body: { sort: [ { addr: { order: asc, missing: "1.2.3.4" } } ] }
+  - match: { error.root_cause.0.reason: "/.*sort.missing.value..1.2.3.4..on..addr...an.ip.field,.is.not.served.*/" }
+  - do:
+      catch: bad_request
+      search:
+        index: ipo_prx
+        body: { sort: [ { addr: { order: asc, missing: "1.2.3.4" } } ] }
+  - match: { error.root_cause.0.reason: "/.*sort.missing.value..1.2.3.4..on..addr...an.ip.field,.is.not.served.*/" }
+
+---
+"A range over documents with several addresses matches a Lucene twin, and a sort over them is refused":
+  - do:
+      indices.create:
+        index: ipm_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { addr: { type: ip } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ipm_luc
+        body:
+          - index: { _id: "s1" }
+          - { addr: [ "3.3.3.3", "200.1.1.1" ] }
+          - index: { _id: "s2" }
+          - { addr: [ "10.0.0.5", "2001:db8::1" ] }
+          - index: { _id: "s3" }
+          - { addr: "100.0.0.0" }
+  - match: { errors: false }
+  - do:
+      indices.create:
+        index: ipm_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { addr: { type: ip } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ipm_def
+        body:
+          - index: { _id: "s1" }
+          - { addr: [ "3.3.3.3", "200.1.1.1" ] }
+          - index: { _id: "s2" }
+          - { addr: [ "10.0.0.5", "2001:db8::1" ] }
+          - index: { _id: "s3" }
+          - { addr: "100.0.0.0" }
+  - match: { errors: false }
+  - do:
+      indices.create:
+        index: ipm_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { addr: { type: ip } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ipm_prx
+        body:
+          - index: { _id: "s1" }
+          - { addr: [ "3.3.3.3", "200.1.1.1" ] }
+          - index: { _id: "s2" }
+          - { addr: [ "10.0.0.5", "2001:db8::1" ] }
+          - index: { _id: "s3" }
+          - { addr: "100.0.0.0" }
+  - match: { errors: false }
+  - do:
+      search:
+        index: ipm_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "100.0.0.0" } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: ipm_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "100.0.0.0" } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: ipm_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "100.0.0.0" } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: ipm_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "10.0.0.0", lte: "10.255.255.255" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: ipm_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "10.0.0.0", lte: "10.255.255.255" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: ipm_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "10.0.0.0", lte: "10.255.255.255" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: ipm_luc
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { lt: "10.0.0.0" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: ipm_def
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { lt: "10.0.0.0" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: ipm_prx
+        body: { size: 0, track_total_hits: true, query: { range: { addr: { lt: "10.0.0.0" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      catch: bad_request
+      search:
+        index: ipm_def
+        body: { sort: [ { addr: asc } ] }
+  - match: { error.root_cause.0.reason: "/.*an.ip.field.some.documents.give.several.values,.is.not.served.*/" }
+  - do:
+      catch: bad_request
+      search:
+        index: ipm_prx
+        body: { sort: [ { addr: asc } ] }
+  - match: { error.root_cause.0.reason: "/.*an.ip.field.some.documents.give.several.values,.is.not.served.*/" }
+
+---
+"Across three shards, an ip sort and a terms key order merge in address order, as a Lucene twin merges them":
+  - do:
+      indices.create:
+        index: ips_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 3, number_of_replicas: 0 }
+          mappings: { properties: { addr: { type: ip }, n: { type: long } } }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: ips_luc
+        body:
+          - index: { _id: "b1" }
+          - {n: 0, addr: "1.0.179.100"}
+          - index: { _id: "b2" }
+          - {n: 1, addr: "1.0.6.192"}
+          - index: { _id: "b3" }
+          - {n: 2, addr: "10.0.0.0"}
+          - index: { _id: "b4" }
+          - {n: 3, addr: "100.0.0.0"}
+          - index: { _id: "b5" }
+          - {n: 4, addr: "9.255.255.255"}
+          - index: { _id: "b6" }
+          - {n: 5, addr: "::1"}
+          - index: { _id: "b7" }
+          - {n: 6, addr: "2001:db8::1"}
+          - index: { _id: "b8" }
+          - {n: 7, addr: "::ffff:10.1.2.3"}
+          - index: { _id: "b9" }
+          - {n: 8, addr: "255.255.255.255"}
+          - index: { _id: "b10" }
+          - {n: 9, addr: "2.2.2.2"}
+          - index: { _id: "b11" }
+          - {n: 10, addr: "10.0.0.0"}
+          - index: { _id: "b12" }
+          - {n: 11}
+  - match: { errors: false }
+  - do:
+      indices.create:
+        index: ips_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 3, number_of_replicas: 0 }
+          mappings: { properties: { addr: { type: ip }, n: { type: long } } }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: ips_def
+        body:
+          - index: { _id: "b1" }
+          - {n: 0, addr: "1.0.179.100"}
+          - index: { _id: "b2" }
+          - {n: 1, addr: "1.0.6.192"}
+          - index: { _id: "b3" }
+          - {n: 2, addr: "10.0.0.0"}
+          - index: { _id: "b4" }
+          - {n: 3, addr: "100.0.0.0"}
+          - index: { _id: "b5" }
+          - {n: 4, addr: "9.255.255.255"}
+          - index: { _id: "b6" }
+          - {n: 5, addr: "::1"}
+          - index: { _id: "b7" }
+          - {n: 6, addr: "2001:db8::1"}
+          - index: { _id: "b8" }
+          - {n: 7, addr: "::ffff:10.1.2.3"}
+          - index: { _id: "b9" }
+          - {n: 8, addr: "255.255.255.255"}
+          - index: { _id: "b10" }
+          - {n: 9, addr: "2.2.2.2"}
+          - index: { _id: "b11" }
+          - {n: 10, addr: "10.0.0.0"}
+          - index: { _id: "b12" }
+          - {n: 11}
+  - match: { errors: false }
+  - do:
+      indices.create:
+        index: ips_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 3, number_of_replicas: 0 }
+          mappings: { properties: { addr: { type: ip }, n: { type: long } } }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: ips_prx
+        body:
+          - index: { _id: "b1" }
+          - {n: 0, addr: "1.0.179.100"}
+          - index: { _id: "b2" }
+          - {n: 1, addr: "1.0.6.192"}
+          - index: { _id: "b3" }
+          - {n: 2, addr: "10.0.0.0"}
+          - index: { _id: "b4" }
+          - {n: 3, addr: "100.0.0.0"}
+          - index: { _id: "b5" }
+          - {n: 4, addr: "9.255.255.255"}
+          - index: { _id: "b6" }
+          - {n: 5, addr: "::1"}
+          - index: { _id: "b7" }
+          - {n: 6, addr: "2001:db8::1"}
+          - index: { _id: "b8" }
+          - {n: 7, addr: "::ffff:10.1.2.3"}
+          - index: { _id: "b9" }
+          - {n: 8, addr: "255.255.255.255"}
+          - index: { _id: "b10" }
+          - {n: 9, addr: "2.2.2.2"}
+          - index: { _id: "b11" }
+          - {n: 10, addr: "10.0.0.0"}
+          - index: { _id: "b12" }
+          - {n: 11}
+  - match: { errors: false }
+  - do:
+      search:
+        index: ips_luc
+        body: { size: 12, sort: [ { addr: asc }, { n: asc } ], _source: false }
+  - length: { hits.hits: 12 }
+  - set: { hits.hits.0._id: sasc_0 }
+  - set: { hits.hits.1._id: sasc_1 }
+  - set: { hits.hits.2._id: sasc_2 }
+  - set: { hits.hits.3._id: sasc_3 }
+  - set: { hits.hits.4._id: sasc_4 }
+  - set: { hits.hits.5._id: sasc_5 }
+  - set: { hits.hits.6._id: sasc_6 }
+  - set: { hits.hits.7._id: sasc_7 }
+  - set: { hits.hits.8._id: sasc_8 }
+  - set: { hits.hits.9._id: sasc_9 }
+  - set: { hits.hits.10._id: sasc_10 }
+  - set: { hits.hits.11._id: sasc_11 }
+  - do:
+      search:
+        index: ips_def
+        body: { size: 12, sort: [ { addr: asc }, { n: asc } ], _source: false }
+  - length: { hits.hits: 12 }
+  - match: { hits.hits.0._id: $sasc_0 }
+  - match: { hits.hits.1._id: $sasc_1 }
+  - match: { hits.hits.2._id: $sasc_2 }
+  - match: { hits.hits.3._id: $sasc_3 }
+  - match: { hits.hits.4._id: $sasc_4 }
+  - match: { hits.hits.5._id: $sasc_5 }
+  - match: { hits.hits.6._id: $sasc_6 }
+  - match: { hits.hits.7._id: $sasc_7 }
+  - match: { hits.hits.8._id: $sasc_8 }
+  - match: { hits.hits.9._id: $sasc_9 }
+  - match: { hits.hits.10._id: $sasc_10 }
+  - match: { hits.hits.11._id: $sasc_11 }
+  - do:
+      search:
+        index: ips_prx
+        body: { size: 12, sort: [ { addr: asc }, { n: asc } ], _source: false }
+  - length: { hits.hits: 12 }
+  - match: { hits.hits.0._id: $sasc_0 }
+  - match: { hits.hits.1._id: $sasc_1 }
+  - match: { hits.hits.2._id: $sasc_2 }
+  - match: { hits.hits.3._id: $sasc_3 }
+  - match: { hits.hits.4._id: $sasc_4 }
+  - match: { hits.hits.5._id: $sasc_5 }
+  - match: { hits.hits.6._id: $sasc_6 }
+  - match: { hits.hits.7._id: $sasc_7 }
+  - match: { hits.hits.8._id: $sasc_8 }
+  - match: { hits.hits.9._id: $sasc_9 }
+  - match: { hits.hits.10._id: $sasc_10 }
+  - match: { hits.hits.11._id: $sasc_11 }
+  - do:
+      search:
+        index: ips_luc
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 6, order: { _key: asc } } } } }
+  - length: { aggregations.t.buckets: 6 }
+  - set: { aggregations.t.buckets.0.key: kasc_0 }
+  - set: { aggregations.t.buckets.1.key: kasc_1 }
+  - set: { aggregations.t.buckets.2.key: kasc_2 }
+  - set: { aggregations.t.buckets.3.key: kasc_3 }
+  - set: { aggregations.t.buckets.4.key: kasc_4 }
+  - set: { aggregations.t.buckets.5.key: kasc_5 }
+  - do:
+      search:
+        index: ips_def
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 6, order: { _key: asc } } } } }
+  - length: { aggregations.t.buckets: 6 }
+  - match: { aggregations.t.buckets.0.key: $kasc_0 }
+  - match: { aggregations.t.buckets.1.key: $kasc_1 }
+  - match: { aggregations.t.buckets.2.key: $kasc_2 }
+  - match: { aggregations.t.buckets.3.key: $kasc_3 }
+  - match: { aggregations.t.buckets.4.key: $kasc_4 }
+  - match: { aggregations.t.buckets.5.key: $kasc_5 }
+  - do:
+      search:
+        index: ips_prx
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 6, order: { _key: asc } } } } }
+  - length: { aggregations.t.buckets: 6 }
+  - match: { aggregations.t.buckets.0.key: $kasc_0 }
+  - match: { aggregations.t.buckets.1.key: $kasc_1 }
+  - match: { aggregations.t.buckets.2.key: $kasc_2 }
+  - match: { aggregations.t.buckets.3.key: $kasc_3 }
+  - match: { aggregations.t.buckets.4.key: $kasc_4 }
+  - match: { aggregations.t.buckets.5.key: $kasc_5 }
+  - do:
+      search:
+        index: ips_luc
+        body: { size: 12, sort: [ { addr: desc }, { n: asc } ], _source: false }
+  - length: { hits.hits: 12 }
+  - set: { hits.hits.0._id: sdesc_0 }
+  - set: { hits.hits.1._id: sdesc_1 }
+  - set: { hits.hits.2._id: sdesc_2 }
+  - set: { hits.hits.3._id: sdesc_3 }
+  - set: { hits.hits.4._id: sdesc_4 }
+  - set: { hits.hits.5._id: sdesc_5 }
+  - set: { hits.hits.6._id: sdesc_6 }
+  - set: { hits.hits.7._id: sdesc_7 }
+  - set: { hits.hits.8._id: sdesc_8 }
+  - set: { hits.hits.9._id: sdesc_9 }
+  - set: { hits.hits.10._id: sdesc_10 }
+  - set: { hits.hits.11._id: sdesc_11 }
+  - do:
+      search:
+        index: ips_def
+        body: { size: 12, sort: [ { addr: desc }, { n: asc } ], _source: false }
+  - length: { hits.hits: 12 }
+  - match: { hits.hits.0._id: $sdesc_0 }
+  - match: { hits.hits.1._id: $sdesc_1 }
+  - match: { hits.hits.2._id: $sdesc_2 }
+  - match: { hits.hits.3._id: $sdesc_3 }
+  - match: { hits.hits.4._id: $sdesc_4 }
+  - match: { hits.hits.5._id: $sdesc_5 }
+  - match: { hits.hits.6._id: $sdesc_6 }
+  - match: { hits.hits.7._id: $sdesc_7 }
+  - match: { hits.hits.8._id: $sdesc_8 }
+  - match: { hits.hits.9._id: $sdesc_9 }
+  - match: { hits.hits.10._id: $sdesc_10 }
+  - match: { hits.hits.11._id: $sdesc_11 }
+  - do:
+      search:
+        index: ips_prx
+        body: { size: 12, sort: [ { addr: desc }, { n: asc } ], _source: false }
+  - length: { hits.hits: 12 }
+  - match: { hits.hits.0._id: $sdesc_0 }
+  - match: { hits.hits.1._id: $sdesc_1 }
+  - match: { hits.hits.2._id: $sdesc_2 }
+  - match: { hits.hits.3._id: $sdesc_3 }
+  - match: { hits.hits.4._id: $sdesc_4 }
+  - match: { hits.hits.5._id: $sdesc_5 }
+  - match: { hits.hits.6._id: $sdesc_6 }
+  - match: { hits.hits.7._id: $sdesc_7 }
+  - match: { hits.hits.8._id: $sdesc_8 }
+  - match: { hits.hits.9._id: $sdesc_9 }
+  - match: { hits.hits.10._id: $sdesc_10 }
+  - match: { hits.hits.11._id: $sdesc_11 }
+  - do:
+      search:
+        index: ips_luc
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 6, order: { _key: desc } } } } }
+  - length: { aggregations.t.buckets: 6 }
+  - set: { aggregations.t.buckets.0.key: kdesc_0 }
+  - set: { aggregations.t.buckets.1.key: kdesc_1 }
+  - set: { aggregations.t.buckets.2.key: kdesc_2 }
+  - set: { aggregations.t.buckets.3.key: kdesc_3 }
+  - set: { aggregations.t.buckets.4.key: kdesc_4 }
+  - set: { aggregations.t.buckets.5.key: kdesc_5 }
+  - do:
+      search:
+        index: ips_def
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 6, order: { _key: desc } } } } }
+  - length: { aggregations.t.buckets: 6 }
+  - match: { aggregations.t.buckets.0.key: $kdesc_0 }
+  - match: { aggregations.t.buckets.1.key: $kdesc_1 }
+  - match: { aggregations.t.buckets.2.key: $kdesc_2 }
+  - match: { aggregations.t.buckets.3.key: $kdesc_3 }
+  - match: { aggregations.t.buckets.4.key: $kdesc_4 }
+  - match: { aggregations.t.buckets.5.key: $kdesc_5 }
+  - do:
+      search:
+        index: ips_prx
+        body: { size: 0, aggs: { t: { terms: { field: addr, size: 6, order: { _key: desc } } } } }
+  - length: { aggregations.t.buckets: 6 }
+  - match: { aggregations.t.buckets.0.key: $kdesc_0 }
+  - match: { aggregations.t.buckets.1.key: $kdesc_1 }
+  - match: { aggregations.t.buckets.2.key: $kdesc_2 }
+  - match: { aggregations.t.buckets.3.key: $kdesc_3 }
+  - match: { aggregations.t.buckets.4.key: $kdesc_4 }
+  - match: { aggregations.t.buckets.5.key: $kdesc_5 }
+  - do:
+      search:
+        index: ips_def
+        body: { size: 3, sort: [ { addr: asc }, { n: asc } ], _source: false }
+  - match: { hits.hits.0._id: b6 }
+  - match: { hits.hits.1._id: b2 }
+  - match: { hits.hits.2._id: b1 }

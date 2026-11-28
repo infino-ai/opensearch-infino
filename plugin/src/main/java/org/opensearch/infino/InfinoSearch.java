@@ -252,9 +252,15 @@ public final class InfinoSearch {
      * {@code missing} value stands in), so no search_after value for it
      * stands for a missing one. {@code asInt} marks a field mapped
      * {@code integer}, {@code short} or {@code byte}, which stock's
-     * comparator reads as a 32-bit int.
+     * comparator reads as a 32-bit int. {@code ip} marks a sort on an ip
+     * field: {@code expr} is the addresses' key ({@link InfinoIp#key}), which
+     * orders them as stock does, and a hit carries the address the key holds.
      */
-    record SortSpec(String expr, String name, SqlType type, boolean desc, boolean nullsFirst, boolean noneMissing, boolean asInt) {
+    record SortSpec(String expr, String name, SqlType type, boolean desc, boolean nullsFirst, boolean noneMissing, boolean asInt, boolean ip) {
+        SortSpec(String expr, String name, SqlType type, boolean desc, boolean nullsFirst, boolean noneMissing, boolean asInt) {
+            this(expr, name, type, desc, nullsFirst, noneMissing, asInt, false);
+        }
+
         SortSpec(String expr, String name, SqlType type, boolean desc, boolean nullsFirst, boolean noneMissing) {
             this(expr, name, type, desc, nullsFirst, noneMissing, false);
         }
@@ -265,7 +271,7 @@ public final class InfinoSearch {
 
         /** This sort on a field stock's comparator reads as a 32-bit int when {@code asInt} ({@link #standIn}). */
         SortSpec asInt(boolean asInt) {
-            return new SortSpec(expr, name, type, desc, nullsFirst, noneMissing, asInt);
+            return new SortSpec(expr, name, type, desc, nullsFirst, noneMissing, asInt, ip);
         }
 
         /** {@link #withMissing(Object, boolean, long)} on a field not mapped {@code float} or {@code half_float}. */
@@ -297,9 +303,16 @@ public final class InfinoSearch {
                 return this;
             }
             if ("_first".equals(text)) {
-                return new SortSpec(expr, name, type, desc, true, false, asInt);
+                return new SortSpec(expr, name, type, desc, true, false, asInt, ip);
             }
             Object value = missing instanceof BytesRef ? text : missing;
+            if (ip) {
+                // Stock compares the value's text with the addresses' 16-byte form, which puts the
+                // rows missing one nowhere near the address the value names.
+                throw new IllegalArgumentException(
+                    "[infino] sort missing value [" + text + "] on [" + name.substring(IP_SORT_PREFIX.length()) + "], an ip field, is not served"
+                );
+            }
             if (type == SqlType.FLOAT) {
                 Double d = floating(value, asFloat);
                 if (d == null) {
@@ -422,12 +435,29 @@ public final class InfinoSearch {
             };
         }
 
-        /** {@code value}, a hit's value for this sort, or the {@link #standIn} for a missing one. */
+        /**
+         * {@code value}, a hit's value for this sort as its row holds it, as
+         * the hit carries it: the {@link #standIn} for a missing one, and the
+         * address for an ip field's key.
+         */
         Object orStandIn(Object value) {
-            return value == null && !noneMissing ? standIn() : value;
+            if (value == null) {
+                return noneMissing ? null : standIn();
+            }
+            return ip ? InfinoIp.shown(value) : value;
         }
+
+        /** What an ip field's sort key is selected under, before the field's name ({@link #of}). */
+        static final String IP_SORT_PREFIX = "infino_ip_sort_";
+
         static SortSpec of(Column c, boolean desc) {
-            return new SortSpec(InfinoQueryTranslator.quoteIdent(c.name()), c.name(), InfinoScriptTranslator.typeOf(c), desc);
+            String column = InfinoQueryTranslator.quoteIdent(c.name());
+            if (InfinoQueryTranslator.isIp(c)) {
+                // Under an alias of its own: under the column's name, the ORDER BY's key of the
+                // column would read the selected key instead.
+                return new SortSpec(InfinoIp.key(column), IP_SORT_PREFIX + c.name(), SqlType.STRING, desc, false, false, false, true);
+            }
+            return new SortSpec(column, c.name(), InfinoScriptTranslator.typeOf(c), desc);
         }
 
         /**
@@ -437,6 +467,13 @@ public final class InfinoSearch {
          * else its least.
          */
         static SortSpec ofValues(Column c, Column values, boolean greatest, boolean desc) {
+            if (InfinoQueryTranslator.isIp(c)) {
+                // The least or greatest of a document's addresses is by their keys, which a list's
+                // own least or greatest (by text) is not, and no statement keys each of a list's values.
+                throw new IllegalArgumentException(
+                    "[infino] sort on [" + c.name() + "], an ip field some documents give several values, is not served"
+                );
+            }
             String pick = (greatest ? "array_max(" : "array_min(") + InfinoQueryTranslator.quoteIdent(values.name()) + ")";
             String expr = c.isList()
                 ? pick
@@ -2399,8 +2436,9 @@ public final class InfinoSearch {
             } else {
                 // A date sort's value as text is read by its field's own format, as stock reads it.
                 Column sorted = plan.cols().get(s.name());
-                String lit = s.name().equals(InfinoSql.ROW_ID)
-                    ? rowIdLiteral(value)
+                // An ip field's address is compared by its key, as the sort orders it.
+                String lit = s.name().equals(InfinoSql.ROW_ID) ? rowIdLiteral(value)
+                    : s.ip() ? InfinoIp.keyLiteral(value)
                     : InfinoQueryTranslator.literalForType(s.type(), value, now, sorted == null ? null : sorted.dateFormat());
                 if (lit == null) {
                     throw new IllegalArgumentException("[infino] search_after value [" + value + "] is not a " + s.type().name().toLowerCase(Locale.ROOT));
@@ -3265,9 +3303,11 @@ public final class InfinoSearch {
     private static Comparator<SearchHit> bySortValues(List<SortSpec> sorts) {
         List<Boolean> desc = new ArrayList<>();
         List<Boolean> nullsFirst = new ArrayList<>();
+        List<Boolean> ip = new ArrayList<>();
         for (SortSpec s : sorts) {
             desc.add(s.desc());
             nullsFirst.add(s.nullsFirst());
+            ip.add(s.ip());
         }
         return (a, b) -> {
             Object[] va = a.getSortValues();
@@ -3287,7 +3327,10 @@ public final class InfinoSearch {
                     continue;
                 }
                 int c;
-                if (va[i] instanceof Comparable ca && vb[i].getClass() == va[i].getClass()) {
+                if (i < ip.size() && ip.get(i)) {
+                    // Addresses in stock's order, by their 16-byte form, not their text.
+                    c = InfinoIp.encoded(va[i]).compareTo(InfinoIp.encoded(vb[i]));
+                } else if (va[i] instanceof Comparable ca && vb[i].getClass() == va[i].getClass()) {
                     c = ca.compareTo(vb[i]);
                 } else if (va[i] instanceof Number na && vb[i] instanceof Number nb) {
                     c = Double.compare(na.doubleValue(), nb.doubleValue());

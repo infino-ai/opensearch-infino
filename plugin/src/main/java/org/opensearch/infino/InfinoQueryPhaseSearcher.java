@@ -55,6 +55,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.function.Supplier;
 
 /**
  * The query phase of a default-mode shard ({@code index.infino.mode: default}),
@@ -268,7 +269,10 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             throw new IllegalArgumentException(InfinoSearch.TERMINATE_AFTER_SCROLL);
         }
         boolean laterRound = scroll != null && scroll.totalHits != null;
-        SearchSourceBuilder source = scroll == null ? carried.source() : scrollRound(carried.source(), scroll, laterRound, searcher);
+        // The sorts a later round's last hit carries values of, read only when it resumes from them.
+        Supplier<List<SortSpec>> roundSorts = () -> InfinoSearch.plan(table, InfinoSearch.scrollSource(carried.source()), clock(context, carried), access)
+            .sorts();
+        SearchSourceBuilder source = scroll == null ? carried.source() : scrollRound(carried.source(), scroll, laterRound, searcher, roundSorts);
         // The coordinating node's clock, so every shard reads `now` the same.
         long now = clock(context, carried);
         // The rows this search's skeleton reader holds, as a stock shard's search sees its reader.
@@ -397,6 +401,13 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         if (sortFields != null) {
             formats = new DocValueFormat[sortFields.length];
             Arrays.fill(formats, DocValueFormat.RAW);
+            for (int i = 0; sorted && i < formats.length; i++) {
+                // An address goes to the coordinating node in its 16-byte form, as stock's does, so the
+                // shards' hits merge in address order; the format prints it.
+                if (plan.sorts().get(i).ip()) {
+                    formats[i] = DocValueFormat.IP;
+                }
+            }
         }
         context.queryResult().topDocs(new TopDocsAndMaxScore(topDocs, page.maxScore()), formats);
         if (scroll != null && !laterRound) {
@@ -427,7 +438,8 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         SearchSourceBuilder written,
         ScrollContext scroll,
         boolean laterRound,
-        ContextIndexSearcher searcher
+        ContextIndexSearcher searcher,
+        Supplier<List<SortSpec>> sorts
     ) throws IOException {
         SearchSourceBuilder round = InfinoSearch.scrollSource(written);
         if (!laterRound) {
@@ -452,7 +464,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
                 round.searchAfter(new Object[] { id });
             }
         } else if (scroll.lastEmittedDoc instanceof FieldDoc last) {
-            round.searchAfter(searchAfter(last.fields));
+            round.searchAfter(searchAfter(last.fields, sorts.get()));
         }
         return round;
     }
@@ -509,7 +521,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
                 return known;
             }
             SearchHit last = page.get(page.size() - 1);
-            SearchSourceBuilder next = InfinoSearch.scrollSource(written).searchAfter(searchAfter(sortValues(last.getSortValues(), plan.sorts())));
+            SearchSourceBuilder next = InfinoSearch.scrollSource(written).searchAfter(searchAfter(sortValues(last.getSortValues(), plan.sorts()), plan.sorts()));
             InfinoSearch.Plan nextPlan = visibleTo(InfinoSearch.plan(plan.table(), next, plan.nowMillis(), plan.access()), cut, generation);
             InfinoSearch.Page read = InfinoSearch.page(index, nextPlan, next, false);
             page = read.hits();
@@ -621,6 +633,10 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
                 out[i] = type == SortField.Type.STRING ? null : missing(type, s);
                 continue;
             }
+            if (s.ip()) {
+                out[i] = InfinoIp.encoded(v);
+                continue;
+            }
             out[i] = switch (type) {
                 case LONG -> v instanceof Number n ? (Object) n.longValue() : (Object) epochMillis(v.toString());
                 case DOUBLE -> v instanceof Number n ? n.doubleValue() : Double.parseDouble(v.toString());
@@ -637,13 +653,15 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
      * back as missing by the plan ({@link InfinoSearch.SortSpec#missingStandIn}),
      * which knows the side its sort puts the missing rows on and whether a
      * {@code missing} value leaves none missing; that value, even the least
-     * or greatest long, is a present one there.
+     * or greatest long, is a present one there. An ip field's address,
+     * carried in its 16-byte form, is the address as text.
      */
-    static Object[] searchAfter(Object[] fields) {
+    static Object[] searchAfter(Object[] fields, List<SortSpec> sorts) {
         Object[] out = new Object[fields.length];
         for (int i = 0; i < fields.length; i++) {
             Object v = fields[i];
-            out[i] = v instanceof BytesRef b ? b.utf8ToString() : v;
+            boolean ip = i < sorts.size() && sorts.get(i).ip();
+            out[i] = v instanceof BytesRef b ? (ip ? InfinoIp.shownEncoded(b) : b.utf8ToString()) : v;
         }
         return out;
     }
