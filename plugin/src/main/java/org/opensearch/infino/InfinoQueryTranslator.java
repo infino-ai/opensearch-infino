@@ -27,6 +27,7 @@ import org.opensearch.index.query.ExistsQueryBuilder;
 import org.opensearch.index.query.IdsQueryBuilder;
 import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
+import org.opensearch.index.query.MatchPhrasePrefixQueryBuilder;
 import org.opensearch.index.query.MatchPhraseQueryBuilder;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.index.query.MultiMatchQueryBuilder;
@@ -43,6 +44,7 @@ import org.opensearch.index.query.SimpleQueryStringBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.index.query.WildcardQueryBuilder;
+import org.opensearch.index.search.MatchQuery.ZeroTermsQuery;
 import org.opensearch.infino.InfinoLuceneQuery.All;
 import org.opensearch.infino.InfinoLuceneQuery.Bool;
 import org.opensearch.infino.InfinoLuceneQuery.Node;
@@ -1474,6 +1476,9 @@ final class InfinoQueryTranslator {
             // A quoted query is a phrase to the engine: the terms adjacent, in order.
             return text(mp.fieldName(), String.valueOf(mp.value()), Operator.AND, positive, true);
         }
+        if (qb instanceof MatchPhrasePrefixQueryBuilder mpp) {
+            return phrasePrefix(mpp);
+        }
         if (qb instanceof MultiMatchQueryBuilder mm) {
             if (mm.type() == MultiMatchQueryBuilder.Type.BOOL_PREFIX || mm.type() == MultiMatchQueryBuilder.Type.PHRASE_PREFIX) {
                 // Their last term is a prefix, which the table's text match does not read; as
@@ -2611,6 +2616,117 @@ final class InfinoQueryTranslator {
         return "\"" + value.replace("\"", " ") + "\"";
     }
 
+    /** The analyzer whose words a phrase prefix reads its query in: the one a text column's index is built with. */
+    private static final String STANDARD_ANALYZER = "standard";
+
+    /**
+     * What may stand between two adjacent words of a text: a run of
+     * characters that are no part of a word. An emoji is a word to the
+     * standard tokenizer, so it parts two words, never joins them.
+     */
+    private static final String WORD_GAP = "[^\\w\\p{Extended_Pictographic}]+";
+
+    /**
+     * A match_phrase_prefix, as stock builds it on a text field: the words
+     * the standard analyzer makes of the query, adjacent and in order, the
+     * last one the start of a word. One word is the prefix of a word, as a
+     * prefix query on the field is ({@link #termPattern}). Over several, the
+     * words before the last are a phrase the token index finds, as a
+     * match_phrase does, and the whole run is a pattern on each of the
+     * field's values, so the last word follows the others in the same value.
+     *
+     * <p>Stock refuses the query on a field that is not a text one, and so
+     * does the table. It is refused, too, where the table would read it
+     * otherwise: an analyzer other than the standard one, a slop over
+     * several words (the token index finds the words adjacent only), or a
+     * word the engine's analyzer and Lucene's may split apart (any but ASCII
+     * letters, digits and underscores, {@link #phrasePrefixWord}). Stock reads the last word as
+     * at most {@code max_expansions} of the words the shard's index holds
+     * that start with it, the first in each segment's order; the table has
+     * no such order, so it reads every word that does.
+     *
+     * <p>The clause scores nothing the table ranks: stock scores it by the
+     * BM25 of each word the last one expands to, which only the shard's own
+     * term index knows.
+     */
+    private String phrasePrefix(MatchPhrasePrefixQueryBuilder q) {
+        String field = q.fieldName();
+        Column c = column(field);
+        if (c == null) {
+            // Stock matches nothing on a field the index does not map.
+            return NONE;
+        }
+        if (!c.fts()) {
+            throw new IllegalArgumentException("Can only use phrase prefix queries on text fields - not on [" + field + "]");
+        }
+        if (q.analyzer() != null && !STANDARD_ANALYZER.equals(q.analyzer())) {
+            throw new IllegalArgumentException(
+                "[infino] match_phrase_prefix with analyzer [" + q.analyzer() + "] is not served: the table reads the query's words with the standard analyzer"
+            );
+        }
+        List<String> words = standardWords(String.valueOf(q.value()));
+        if (words.isEmpty()) {
+            return q.zeroTermsQuery() == ZeroTermsQuery.ALL ? ALL : NONE;
+        }
+        for (String w : words) {
+            if (!phrasePrefixWord(w)) {
+                throw new IllegalArgumentException(
+                    "[infino] match_phrase_prefix on ["
+                        + field
+                        + "] is not served for the word ["
+                        + w
+                        + "]: only words of ASCII letters, digits and underscores are read as stock reads them"
+                );
+            }
+        }
+        String last = words.get(words.size() - 1);
+        if (words.size() == 1) {
+            // A word of ASCII letters, digits and underscores holds no character a pattern reads otherwise.
+            return termPattern(c, last, true);
+        }
+        if (q.slop() > 0) {
+            throw new IllegalArgumentException("[infino] match_phrase_prefix with slop over several words is not served: the token index finds the words adjacent only");
+        }
+        List<String> leading = words.subList(0, words.size() - 1);
+        String run = String.join(WORD_GAP, leading) + WORD_GAP + last;
+        String inOneValue = anyValue(c, v -> termPattern(v, run, true));
+        if (inOneValue == null) {
+            return null;
+        }
+        return "(" + textClause(c.name(), phrase(String.join(" ", leading)), "and", false) + " AND " + inOneValue + ")";
+    }
+
+    /**
+     * Whether a word of a match_phrase_prefix is one token to both analyzers,
+     * so the table finds it where stock does: a word {@link #oneToken} takes,
+     * or one with underscores in it. Lucene's tokenizer and the engine's both
+     * keep an underscore inside a word ({@code my_dash} is one token to each,
+     * the UAX #29 rule for a connector such as {@code _}), and a pattern
+     * reads it as a word character too, so {@code \bdash} does not start
+     * inside {@code my_dashboard}, as stock's prefix does not.
+     */
+    static boolean phrasePrefixWord(String word) {
+        return oneToken(word.replace('_', 'a'));
+    }
+
+    /** The words Lucene's standard tokenizer makes of {@code text}, in order. */
+    private static List<String> standardWords(String text) {
+        List<String> words = new ArrayList<>();
+        try (StandardTokenizer tokenizer = new StandardTokenizer()) {
+            CharTermAttribute term = tokenizer.addAttribute(CharTermAttribute.class);
+            tokenizer.setReader(new StringReader(text));
+            tokenizer.reset();
+            while (tokenizer.incrementToken()) {
+                words.add(term.toString());
+            }
+            tokenizer.end();
+        } catch (IOException e) {
+            // A string reader does not fail.
+            throw new UncheckedIOException(e);
+        }
+        return words;
+    }
+
     /** A closed phrase of a simple_query_string with no escape in it, whose words are no operators in either syntax. */
     private static final Pattern SIMPLE_PHRASE = Pattern.compile("\"[^\"\\\\]*\"");
 
@@ -2902,17 +3018,8 @@ final class InfinoQueryTranslator {
 
     /** Whether the standard tokenizer makes exactly one token of the whole of {@code text}. */
     private static boolean oneStandardToken(String text) {
-        try (StandardTokenizer tokenizer = new StandardTokenizer()) {
-            CharTermAttribute term = tokenizer.addAttribute(CharTermAttribute.class);
-            tokenizer.setReader(new StringReader(text));
-            tokenizer.reset();
-            boolean one = tokenizer.incrementToken() && term.length() == text.length() && !tokenizer.incrementToken();
-            tokenizer.end();
-            return one;
-        } catch (IOException e) {
-            // A string reader does not fail.
-            throw new UncheckedIOException(e);
-        }
+        List<String> words = standardWords(text);
+        return words.size() == 1 && words.get(0).length() == text.length();
     }
 
     /**
@@ -3241,8 +3348,13 @@ final class InfinoQueryTranslator {
      * its terms.
      */
     private static String termPattern(Column c, String regex, boolean openEnd) {
+        return termPattern(quoteIdent(c.name()), regex, openEnd);
+    }
+
+    /** {@link #termPattern(Column, String, boolean)} over a column expression: a column, or one value of a list column. */
+    private static String termPattern(String value, String regex, boolean openEnd) {
         String bounded = "\\b" + regex + (openEnd ? "" : "\\b");
-        return "regexp_like(" + quoteIdent(c.name()) + ", " + literal(bounded) + ", 'i')";
+        return "regexp_like(" + value + ", " + literal(bounded) + ", 'i')";
     }
 
     /**
