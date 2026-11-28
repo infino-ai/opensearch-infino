@@ -32,6 +32,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod attached;
+mod narrow;
 mod read_sql;
 
 use std::borrow::Cow;
@@ -830,6 +831,10 @@ impl Bridge {
         conn: &Connection,
         sql: &str,
     ) -> Result<Vec<RecordBatch>, InfinoError> {
+        // A text lookup the statement tests ids against reads the whole
+        // table unless it is given the statement's filters; see `narrow`.
+        let narrowed = narrow::text_subqueries(sql);
+        let sql = narrowed.as_deref().unwrap_or(sql);
         let Some(viewed) = self.attached_sql(sql) else {
             return conn.query_sql(sql);
         };
@@ -8870,6 +8875,36 @@ mod tests {
         assert_eq!(bridge.conn.open_table("plain").unwrap().schema(), before);
         // A table of the plugin's own is written as before.
         assert_eq!(index(h, &[("a", r#"{"level":"info"}"#)])["ok"], 1);
+        close(h);
+    }
+
+    #[test]
+    fn a_lookup_narrowed_by_the_filters_beside_it_gives_the_same_rows() {
+        let h = open_logs();
+        plain_table(bridge_ref(h).unwrap());
+        assert!(attach_plain(h, PLAIN_MAPPING).contains("\"added\":0"));
+        let lookup = "osid IN (SELECT osid FROM token_match('plain', 'title', 'india', 'and'))";
+        let titles = |statement: &str| -> Vec<String> {
+            let rows = sql(h, statement);
+            rows.as_array()
+                .unwrap_or_else(|| panic!("{rows}"))
+                .iter()
+                .map(|row| row["title"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // Each statement is one `narrow::text_subqueries` changes, so what
+        // ran is the narrowed one.
+        for (condition, kept) in [
+            (format!("{lookup} AND \"hits\" > 4"), vec!["India national team", "India"]),
+            (format!("{lookup} AND \"hits\" > 6"), vec!["India national team"]),
+            (format!("NOT ({lookup}) AND \"hits\" < 6"), vec!["Pope Leo XIV"]),
+            (format!("({lookup} OR \"hits\" < 4) AND \"hits\" < 6"), vec!["India", "Pope Leo XIV"]),
+        ] {
+            let statement =
+                format!("SELECT \"title\" AS title FROM \"plain\" WHERE {condition} ORDER BY \"hits\" DESC");
+            assert!(narrow::text_subqueries(&statement).is_some(), "{statement}");
+            assert_eq!(titles(&statement), kept, "{statement}");
+        }
         close(h);
     }
 

@@ -129,7 +129,7 @@ fn added_columns(columns: &[String]) -> String {
 }
 
 /// The one query `sql` is, or none when it is anything else.
-fn parse(sql: &str) -> Option<Query> {
+pub(crate) fn parse(sql: &str) -> Option<Query> {
     let mut statements = DFParser::parse_sql(sql).ok()?;
     if statements.len() != 1 {
         return None;
@@ -144,7 +144,7 @@ fn parse(sql: &str) -> Option<Query> {
 }
 
 /// The table an engine search names: its first argument, a string.
-fn searched(args: &[FunctionArg]) -> Option<&str> {
+pub(crate) fn searched(args: &[FunctionArg]) -> Option<&str> {
     let (FunctionArg::Unnamed(a)
     | FunctionArg::Named { arg: a, .. }
     | FunctionArg::ExprNamed { arg: a, .. }) = args.first()?;
