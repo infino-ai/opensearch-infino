@@ -20,8 +20,13 @@ import org.opensearch.cluster.routing.OperationRouting;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.util.concurrent.ThreadContext;
+import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.core.xcontent.MediaType;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.mapper.IdFieldMapper;
 import org.opensearch.index.mapper.Uid;
@@ -49,8 +54,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * row's own source, so each of the shard's copies gets it as it gets any
  * write, routed by the routing value the row was written with when it was
  * written with one. The table already holds these rows, so the primary's
- * engine leaves the table alone for them (the request carries
- * {@link #SKELETON_ONLY}).
+ * engine leaves the table alone for them: it takes a create as one of the
+ * rebuild's when this node's rebuild of the shard has it in flight, with the
+ * same content ({@link #claim}).
  * Each is a create, so a client's write of the same id wins; a row a client
  * deleted while its create was in flight is deleted again through the
  * shard, so the skeleton and the translog end where the table is. Until a
@@ -65,8 +71,15 @@ final class InfinoSkeletonAdopter {
 
     private static final Logger log = LogManager.getLogger(InfinoSkeletonAdopter.class);
 
-    /** The header a skeleton-only write carries, so the primary's engine writes Lucene alone. */
-    static final String SKELETON_ONLY = "_infino_skeleton_only";
+    /**
+     * The creates this node's rebuilds have in flight: by shard, each id's
+     * source as the rebuild sent it. The primary's engine looks a create up
+     * here ({@link #claim}) rather than in a header, which does not survive
+     * the hop to the shard (the security plugin forwards its own headers
+     * only), or in the source's bytes, which a mapper may write anew (the
+     * k-NN plugin's derived source does for an index with a vector field).
+     */
+    private static final Map<ShardId, Map<String, String>> IN_FLIGHT = new ConcurrentHashMap<>();
     /** Rows read from the table per page. */
     private static final int PAGE_ROWS = 10_000;
     /** The count's alias in the row-count statement. */
@@ -157,7 +170,7 @@ final class InfinoSkeletonAdopter {
                 }
             }
             if (!missing.isEmpty()) {
-                created += createMissing(md.getIndex().getName(), table, missing);
+                created += createMissing(shardId, table, missing);
             }
             if (page.size() < PAGE_ROWS) {
                 break;
@@ -231,9 +244,12 @@ final class InfinoSkeletonAdopter {
      * delete through the shard any whose row the table lost meanwhile.
      * Returns the documents created.
      */
-    private static long createMissing(String index, String table, Map<String, Row> missing) {
+    private static long createMissing(ShardId shardId, String table, Map<String, Row> missing) {
+        String index = shardId.getIndexName();
         BulkRequest creates = new BulkRequest();
+        Map<String, String> inFlight = new ConcurrentHashMap<>();
         for (Map.Entry<String, Row> row : missing.entrySet()) {
+            inFlight.put(row.getKey(), row.getValue().source());
             creates.add(
                 new IndexRequest(index).id(row.getKey())
                     .routing(row.getValue().routing())
@@ -242,10 +258,15 @@ final class InfinoSkeletonAdopter {
             );
         }
         List<String> created = new ArrayList<>();
-        for (BulkItemResponse item : run(creates, true).getItems()) {
-            if (!item.isFailed()) {
-                created.add(item.getId());
+        track(shardId, inFlight);
+        try {
+            for (BulkItemResponse item : run(creates).getItems()) {
+                if (!item.isFailed()) {
+                    created.add(item.getId());
+                }
             }
+        } finally {
+            untrack(shardId, inFlight);
         }
         if (created.isEmpty()) {
             return 0;
@@ -261,18 +282,60 @@ final class InfinoSkeletonAdopter {
             }
         }
         if (deletes.numberOfActions() > 0) {
-            run(deletes, false);
+            run(deletes);
         }
         return created.size();
     }
 
-    /** Run {@code bulk} as the node, skeleton-only when asked, and wait for it. */
-    private static BulkResponse run(BulkRequest bulk, boolean skeletonOnly) {
+    /** Hold {@code inFlight} (source by id) as the creates the rebuild of {@code shard} has in flight, for {@link #claim}. */
+    static void track(ShardId shard, Map<String, String> inFlight) {
+        IN_FLIGHT.put(shard, inFlight);
+    }
+
+    /** Let go of {@code inFlight}, once its bulk has been answered. */
+    static void untrack(ShardId shard, Map<String, String> inFlight) {
+        IN_FLIGHT.remove(shard, inFlight);
+    }
+
+    /**
+     * Whether a create of {@code id} that the primary of {@code shard}
+     * applies is one this node's rebuild of the shard has in flight, with the
+     * same content, so its row is in the table already; it is claimed once.
+     * The rebuild runs on the node of the shard's primary, so its creates
+     * reach this node's engine. The content is compared as bytes first, then
+     * as parsed documents ({@code type} is the source's, null for JSON): a
+     * mapper may have written the source anew. A create with other content,
+     * or one the rebuild does not have in flight, is a client's write, which
+     * the engine writes to the table as any other.
+     */
+    static boolean claim(ShardId shard, String id, BytesReference source, MediaType type) {
+        Map<String, String> inFlight = IN_FLIGHT.get(shard);
+        if (inFlight == null || source == null) {
+            return false;
+        }
+        String sent = inFlight.get(id);
+        return sent != null && sameContent(sent, source, type) && inFlight.remove(id, sent);
+    }
+
+    /** Whether {@code source} (of media type {@code type}, null for JSON) holds the JSON document {@code sent}. */
+    static boolean sameContent(String sent, BytesReference source, MediaType type) {
+        BytesArray sentBytes = new BytesArray(sent);
+        if ((type == null || type == MediaTypeRegistry.JSON) && sentBytes.equals(source)) {
+            return true;
+        }
+        try {
+            return XContentHelper.convertToMap(sentBytes, false, MediaTypeRegistry.JSON)
+                .v2()
+                .equals(XContentHelper.convertToMap(source, false, type == null ? MediaTypeRegistry.JSON : type).v2());
+        } catch (RuntimeException e) {
+            return false; // a source that does not parse is no rebuild's
+        }
+    }
+
+    /** Run {@code bulk} as the node and wait for it. */
+    private static BulkResponse run(BulkRequest bulk) {
         ThreadContext context = InfinoServices.threadPool().getThreadContext();
         try (ThreadContext.StoredContext ignored = context.stashContext()) {
-            if (skeletonOnly) {
-                context.putHeader(SKELETON_ONLY, Boolean.TRUE.toString());
-            }
             PlainActionFuture<BulkResponse> response = PlainActionFuture.newFuture();
             InfinoClient.bulk(bulk, response);
             return response.actionGet();

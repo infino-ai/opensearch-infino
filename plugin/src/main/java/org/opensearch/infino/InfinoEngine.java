@@ -17,6 +17,7 @@ import org.apache.lucene.util.BytesRef;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.common.Randomness;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
+import org.opensearch.common.lucene.uid.Versions;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
@@ -683,9 +684,22 @@ public class InfinoEngine extends InternalEngine {
         }
     }
 
-    /** Whether the write being applied is a skeleton-only one, whose row the table holds already. */
-    private boolean skeletonOnly() {
-        return config().getThreadPool().getThreadContext().getHeader(InfinoSkeletonAdopter.SKELETON_ONLY) != null;
+    /**
+     * Whether {@code index} is a create this node's skeleton rebuild sent for
+     * a row the table holds already ({@link InfinoSkeletonAdopter#claim}), so
+     * the primary writes Lucene alone. Without this, every rebuilt row was
+     * written to the table again as a replace (a lookup, a delete and an
+     * append per row), whose native memory grows with the table.
+     */
+    private boolean skeletonOnly(Index index) {
+        return index.origin() == Operation.Origin.PRIMARY
+            && index.version() == Versions.MATCH_DELETED
+            && InfinoSkeletonAdopter.claim(
+                shardId,
+                index.id(),
+                index.source(),
+                index.parsedDoc() == null ? null : index.parsedDoc().getMediaType()
+            );
     }
 
     public InfinoEngine(EngineConfig config) {
@@ -1283,7 +1297,7 @@ public class InfinoEngine extends InternalEngine {
 
     @Override
     public IndexResult index(Index index) throws IOException {
-        boolean toTable = writesTable(index.origin()) && !skeletonOnly();
+        boolean toTable = writesTable(index.origin()) && !skeletonOnly(index);
         if (toTable) {
             refuseWhileBacklogged(index.origin());
         }
