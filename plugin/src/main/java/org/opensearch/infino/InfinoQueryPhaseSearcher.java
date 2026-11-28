@@ -237,6 +237,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
                     b,
                     plan.cols(),
                     table,
+                    List.of(table),
                     qb -> InfinoQueryTranslator.predicate(qb, plan.cols(), table, now),
                     access,
                     position++,

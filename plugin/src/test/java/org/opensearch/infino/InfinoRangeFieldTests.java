@@ -38,7 +38,7 @@ public class InfinoRangeFieldTests extends OpenSearchTestCase {
     private static final String MAPPING = """
         {"properties":{"r":{"type":"long_range"},"i":{"type":"integer_range"},"d":{"type":"double_range"},
          "span":{"type":"date_range","format":"yyyy-MM-dd||epoch_millis"},"ip":{"type":"ip_range"},
-         "alias_r":{"type":"alias","path":"r"},"n":{"type":"long"}}}""";
+         "alias_r":{"type":"alias","path":"r"},"n":{"type":"long"},"f":{"type":"float_range"},"ts":{"type":"date"}}}""";
     private static final String UTC = ", 'Timestamp(Millisecond, Some(\"UTC\"))')";
 
     @Override
@@ -58,6 +58,9 @@ public class InfinoRangeFieldTests extends OpenSearchTestCase {
         }
         cols.put("d.from", new Column("d.from", "f64", false, false));
         cols.put("d.to", new Column("d.to", "f64", false, false));
+        cols.put("f.from", new Column("f.from", "f64", false, false));
+        cols.put("f.to", new Column("f.to", "f64", false, false));
+        cols.put("ts", new Column("ts", "ts", false, false));
         cols.put("span.from", new Column("span.from", "ts", false, false));
         cols.put("span.to", new Column("span.to", "ts", false, false));
         if (lists) {
@@ -124,6 +127,74 @@ public class InfinoRangeFieldTests extends OpenSearchTestCase {
         assertEquals("(\"r.from\" IS NOT NULL OR \"r.from[]\" IS NOT NULL)", whereMulti(QueryBuilders.existsQuery("r")));
     }
 
+    public void testATermsQueryReadsTheListsOnceForAllItsValues() {
+        String w = whereMulti(QueryBuilders.termsQuery("r", List.of(7, 9, 11)));
+        assertEquals(w, 1, w.split("osid IN \\(SELECT", -1).length - 1);
+        assertTrue(w, w.contains("WHERE ((range_rows.range_low <= 7 AND range_rows.range_high >= 7) OR (range_rows.range_low <= 9 AND range_rows.range_high >= 9) OR "));
+        // A long list is read as rows, so the statement's AND and OR stay few whatever its length.
+        List<Integer> many = new java.util.ArrayList<>();
+        for (int i = 0; i < 1000; i++) {
+            many.add(i * 3);
+        }
+        w = whereMulti(QueryBuilders.termsQuery("r", many));
+        assertEquals(w, 1, w.split("osid IN \\(SELECT", -1).length - 1);
+        assertTrue(w, w.contains("EXISTS (SELECT 1 FROM (VALUES (0, 0), (3, 3), "));
+        assertTrue(w, w.split(" AND | OR ", -1).length < 20);
+    }
+
+    public void testAFloatRangeReadsQueryValuesAsFloats() {
+        // 1.00000005 is nearer 1 than the next float, so it is 1, as stock reads it.
+        assertEquals("(\"f.from\" <= 1.0 AND \"f.to\" >= 1.0)", where(QueryBuilders.termQuery("f", 1.00000005)));
+        // An exclusive bound moves to the next float, not the next double.
+        assertEquals(
+            "(\"f.from\" <= " + Double.MAX_VALUE + " AND \"f.to\" >= " + (double) Math.nextUp(1.0f) + ")",
+            where(QueryBuilders.rangeQuery("f").gt(1))
+        );
+        // A double range keeps doubles.
+        assertEquals("(\"d.from\" <= 1.00000005 AND \"d.to\" >= 1.00000005)", where(QueryBuilders.termQuery("d", 1.00000005)));
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> where(QueryBuilders.termQuery("f", 1e39)));
+        assertEquals("[float] supports only finite values, but got [1.0E39]", e.getMessage());
+        // Bounds in the wrong order once rounded to floats are refused, as stock refuses them.
+        e = expectThrows(IllegalArgumentException.class, () -> where(QueryBuilders.rangeQuery("f").gt(0.99999999).lt(0.5)));
+        assertEquals("Range query `from` value (1.0) is greater than `to` value (0.5)", e.getMessage());
+        e = expectThrows(IllegalArgumentException.class, () -> where(QueryBuilders.rangeQuery("r").gte(5).lte(3)));
+        assertEquals("Range query `from` value (5) is greater than `to` value (3)", e.getMessage());
+        // Bounds that leave nothing only once an exclusive one moves match nothing.
+        assertEquals(InfinoQueryTranslator.NONE, where(QueryBuilders.rangeQuery("r").gt(5).lt(6)));
+    }
+
+    public void testOverSeveralTablesEachRowReadsItsOwnTablesRanges() {
+        InfinoRangeField first = InfinoRangeField.of(TABLE, columns(false), "r");
+        assertFalse(first.multi());
+        // Only the second table holds documents with several ranges.
+        InfinoRangeField both = first.over(List.of(TABLE, MULTI_TABLE), t -> columns(t.equals(MULTI_TABLE)));
+        assertTrue(both.multi());
+        String p = both.pairs(false, (l, h) -> "(" + l + " <= 7 AND " + h + " >= 7)");
+        assertTrue(p, p.startsWith("(CASE \"_infino_shard\" WHEN 0 THEN ((\"r.from\" <= 7 AND \"r.to\" >= 7)) WHEN 1 THEN (((\"r.from[]\" IS NULL AND "));
+        assertTrue(p, p.contains("FROM \"" + MULTI_TABLE + "\" range_source"));
+        assertFalse(p, p.contains("FROM \"" + TABLE + "\""));
+        assertSame(first, first.over(List.of(TABLE), t -> columns(false)));
+        // The ranges are read from every table's lists, a null one where a table has none.
+        HistogramAggregationBuilder h = new HistogramAggregationBuilder("h").field("r").interval(5);
+        InfinoRangeField.Samples samples = both.samples("h", 5, null, null, 100, 100);
+        String relation = samples.relation("\"u\"", "\"r\"", "value_layer_0");
+        assertTrue(relation, relation.contains("unnest(CASE WHEN \"r.from[]\" IS NULL THEN make_array(\"r.from\") ELSE \"r.from[]\" END)"));
+        assertTrue(h.getName(), samples.reaching(5, 10).startsWith("(CASE \"_infino_shard\" WHEN 0 THEN "));
+    }
+
+    public void testHardBoundsOnADateColumnAddALooseRangeOnIt() {
+        DateHistogramAggregationBuilder dh = new DateHistogramAggregationBuilder("h").field("ts")
+            .calendarInterval(DateHistogramInterval.DAY)
+            .hardBounds(new org.opensearch.search.aggregations.bucket.histogram.LongBounds("2016-01-02T06:00:00Z", "2016-01-04T06:00:00Z"));
+        Grouped g = Grouped.dateHistogram(dh, columns(false), TABLE, List.of(TABLE), Leaves.NONE, null, NOW);
+        long min = Instant.parse("2016-01-02T06:00:00Z").toEpochMilli();
+        // A bucket is kept before the upper bound, as stock keeps it: the day holding the bound is the last.
+        long until = Instant.parse("2016-01-05T00:00:00Z").toEpochMilli();
+        assertEquals("\"ts\" >= " + InfinoAggregationProcessor.timestampLiteral(min) + " AND \"ts\" < " + InfinoAggregationProcessor.timestampLiteral(until), g.within);
+        assertTrue(g.keyExpr, g.keyExpr.contains(" < " + InfinoAggregationProcessor.timestampLiteral(Instant.parse("2016-01-04T06:00:00Z").toEpochMilli())));
+        assertNull(Grouped.dateHistogram(dh.hardBounds(null), columns(false), TABLE, List.of(TABLE), Leaves.NONE, null, NOW).within);
+    }
+
     public void testWhatTheColumnsCannotAnswerIsRefused() {
         IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> where(QueryBuilders.prefixQuery("r", "1")));
         assertTrue(e.getMessage(), e.getMessage().contains("a query on [r], a field of type [long_range], is not served"));
@@ -139,7 +210,7 @@ public class InfinoRangeFieldTests extends OpenSearchTestCase {
     }
 
     public void testAHistogramReadsAValuePerIntervalOfEachRange() {
-        Grouped g = Grouped.histogram(new HistogramAggregationBuilder("h").field("r").interval(200000), columns(false), TABLE, Leaves.NONE, null, NOW);
+        Grouped g = Grouped.histogram(new HistogramAggregationBuilder("h").field("r").interval(200000), columns(false), TABLE, List.of(TABLE), Leaves.NONE, null, NOW);
         assertTrue(g.source.multi());
         assertEquals("floor(((\"r\") - 0.0) / 200000.0) * 200000.0 + 0.0", g.keyExpr);
         String relation = InfinoAggregationProcessor.valuesRelation("\"" + TABLE + "\"", List.of(g.source));
@@ -153,15 +224,17 @@ public class InfinoRangeFieldTests extends OpenSearchTestCase {
 
     public void testHardBoundsCutEachRangeBeforeItIsRead() {
         HistogramAggregationBuilder h = new HistogramAggregationBuilder("h").field("r").interval(1).hardBounds(new org.opensearch.search.aggregations.bucket.histogram.DoubleBounds(0.0, 20.0));
-        Grouped g = Grouped.histogram(h, columns(false), TABLE, Leaves.NONE, null, NOW);
+        Grouped g = Grouped.histogram(h, columns(false), TABLE, List.of(TABLE), Leaves.NONE, null, NOW);
         String relation = InfinoAggregationProcessor.valuesRelation("\"" + TABLE + "\"", List.of(g.source));
         assertTrue(relation, relation.contains("GREATEST(CAST(\"value_layer_0_low\" AS DOUBLE), 0.0)"));
-        assertTrue(relation, relation.contains("LEAST(CAST(\"value_layer_0_high\" AS DOUBLE), 21.0)"));
+        assertTrue(relation, relation.contains("LEAST(CAST(\"value_layer_0_high\" AS DOUBLE), 20.0)"));
+        // As stock cuts a range, with no test of the bucket's key beside.
+        assertFalse(g.keyExpr, g.keyExpr.startsWith("CASE"));
     }
 
     public void testADateHistogramReadsADateRangeAtItsNarrowestBucket() {
         DateHistogramAggregationBuilder dh = new DateHistogramAggregationBuilder("h").field("span").calendarInterval(DateHistogramInterval.MONTH);
-        Grouped g = Grouped.dateHistogram(dh, columns(false), TABLE, Leaves.NONE, null, NOW);
+        Grouped g = Grouped.dateHistogram(dh, columns(false), TABLE, List.of(TABLE), Leaves.NONE, null, NOW);
         String relation = InfinoAggregationProcessor.valuesRelation("\"" + TABLE + "\"", List.of(g.source));
         // A month is at least 28 days.
         assertTrue(relation, relation.contains(" / " + (28 * 86_400_000.0) + ")"));
@@ -172,7 +245,7 @@ public class InfinoRangeFieldTests extends OpenSearchTestCase {
         // A numeric range field has no dates to bucket.
         IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> Grouped.dateHistogram(new DateHistogramAggregationBuilder("h").field("r").calendarInterval(DateHistogramInterval.MONTH), columns(false), TABLE, Leaves.NONE, null, NOW)
+            () -> Grouped.dateHistogram(new DateHistogramAggregationBuilder("h").field("r").calendarInterval(DateHistogramInterval.MONTH), columns(false), TABLE, List.of(TABLE), Leaves.NONE, null, NOW)
         );
         assertTrue(e.getMessage(), e.getMessage().contains("needs a date value, [r] is of type [long_range]"));
     }
@@ -183,12 +256,12 @@ public class InfinoRangeFieldTests extends OpenSearchTestCase {
         DateHistogramAggregationBuilder dh = new DateHistogramAggregationBuilder("h").field("span")
             .calendarInterval(DateHistogramInterval.MONTH)
             .hardBounds(new org.opensearch.search.aggregations.bucket.histogram.LongBounds("2015-06-01", "2016-06-01"));
-        Grouped g = Grouped.dateHistogram(dh, columns(false), TABLE, Leaves.NONE, null, NOW);
+        Grouped g = Grouped.dateHistogram(dh, columns(false), TABLE, List.of(TABLE), Leaves.NONE, null, NOW);
         long june = Instant.parse("2015-06-01T00:00:00Z").toEpochMilli();
-        long julyEnd = Instant.parse("2016-07-01T00:00:00Z").toEpochMilli() - 1;
+        long upper = Instant.parse("2016-06-01T00:00:00Z").toEpochMilli();
         String relation = InfinoAggregationProcessor.valuesRelation("\"" + TABLE + "\"", List.of(g.source));
         assertTrue(relation, relation.contains("GREATEST(CAST(arrow_cast(\"value_layer_0_low\", 'Int64') AS DOUBLE), " + (double) june + ")"));
-        assertTrue(relation, relation.contains("LEAST(CAST(arrow_cast(\"value_layer_0_high\", 'Int64') AS DOUBLE), " + (double) julyEnd + ")"));
-        assertTrue(g.keyExpr, g.keyExpr.startsWith("CASE WHEN "));
+        assertTrue(relation, relation.contains("LEAST(CAST(arrow_cast(\"value_layer_0_high\", 'Int64') AS DOUBLE), " + (double) upper + ")"));
+        assertFalse(g.keyExpr, g.keyExpr.startsWith("CASE WHEN "));
     }
 }

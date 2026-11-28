@@ -31,12 +31,14 @@ import org.opensearch.search.aggregations.bucket.filter.FiltersAggregationBuilde
 import org.opensearch.search.aggregations.bucket.filter.FiltersAggregator;
 import org.opensearch.search.aggregations.bucket.terms.SignificantTermsAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.fetch.subphase.FieldAndFormat;
 import org.opensearch.search.fetch.subphase.highlight.HighlightBuilder;
 import org.opensearch.search.rescore.QueryRescorerBuilder;
 import org.opensearch.search.rescore.RescorerBuilder;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -72,6 +74,7 @@ final class InfinoSearchChecks {
             checkRescores(source, settings);
             checkFields(source, settings);
             checkTokenCountDocValues(source, properties);
+            checkRangeFetchFields(source, properties);
             if (source.storedFields() != null) {
                 checkNoStoredFields(source);
                 String stored = storedField(properties, source.storedFields().fieldNames());
@@ -197,6 +200,49 @@ final class InfinoSearchChecks {
                 throw new IllegalArgumentException(
                     "Can't load fielddata on [" + e.getKey() + "] because fielddata is unsupported on fields of type [integer]. Use doc values instead."
                 );
+            }
+        }
+    }
+
+    /**
+     * A {@code fields} entry, by name or pattern, reaching a range field:
+     * stock answers each range parsed from the source, its bounds formatted
+     * by the field's type, where the source read flattened would give its
+     * bounds as fields of their own. Refused until it is served, when the
+     * request returns hits.
+     */
+    static void checkRangeFetchFields(SearchSourceBuilder source, Map<String, Object> properties) {
+        if (source.fetchFields() == null || source.fetchFields().isEmpty() || source.size() == 0) {
+            return;
+        }
+        Map<String, String> ranges = new LinkedHashMap<>();
+        rangeFields("", properties, ranges);
+        for (FieldAndFormat f : source.fetchFields()) {
+            for (Map.Entry<String, String> range : ranges.entrySet()) {
+                String path = range.getKey();
+                // A pattern reaching the range's own bounds, as the flattened source names them, is refused too.
+                if (Regex.simpleMatch(f.field, path) || Regex.simpleMatch(f.field, path + ".gte") || Regex.simpleMatch(f.field, path + ".lt")
+                    || Regex.simpleMatch(f.field, path + ".gt") || Regex.simpleMatch(f.field, path + ".lte")) {
+                    throw new IllegalArgumentException(
+                        "[infino] fields [" + f.field + "] reaches [" + path + "], a field of type [" + range.getValue() + "], which is not served"
+                    );
+                }
+            }
+        }
+    }
+
+    /** The range fields under {@code prefix} of {@code properties}, by path, each with its type. */
+    @SuppressWarnings("unchecked")
+    private static void rangeFields(String prefix, Map<String, Object> properties, Map<String, String> out) {
+        for (Map.Entry<String, Object> e : properties.entrySet()) {
+            if (!(e.getValue() instanceof Map<?, ?> m)) {
+                continue;
+            }
+            String path = prefix + e.getKey();
+            if (m.get("type") instanceof String type && InfinoRangeField.TYPES.contains(type)) {
+                out.put(path, type);
+            } else if (m.get("properties") instanceof Map<?, ?> children) {
+                rangeFields(path + ".", (Map<String, Object>) children, out);
             }
         }
     }

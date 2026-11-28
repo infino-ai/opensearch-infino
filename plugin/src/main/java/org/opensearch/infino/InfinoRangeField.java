@@ -9,8 +9,11 @@ import org.opensearch.infino.InfinoNative.Column;
 
 import java.math.BigDecimal;
 import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 
 import static org.opensearch.infino.InfinoQueryTranslator.LIST_SUFFIX;
 import static org.opensearch.infino.InfinoQueryTranslator.OSID;
@@ -56,6 +59,18 @@ final class InfinoRangeField {
     private static final String PAIR_LOW = "range_low";
     private static final String PAIR_HIGH = "range_high";
     private static final String SAMPLE_INDEX = "range_sample";
+    /** The aliases a terms query's list of values is named by ({@link #holdingAny}). */
+    private static final String TERMS = "range_terms";
+    private static final String TERM_LOW = "range_term_low";
+    private static final String TERM_HIGH = "range_term_high";
+
+    /**
+     * The most values a terms query tests one by one, each a comparison the
+     * engine can skip files by. A longer list is read as a list of rows,
+     * which holds any number of values: the engine refuses a statement of
+     * more than about a thousand AND and OR.
+     */
+    private static final int MAX_INLINE_TERMS = 16;
 
     /** What a mapping declares of a range field: its path, its type and its date format (null for the default). */
     record Declared(String path, String type, String format) {}
@@ -76,8 +91,27 @@ final class InfinoRangeField {
     private final Column to;
     private final Column fromList;
     private final Column toList;
+    /**
+     * The field as each table of a union read as one relation keeps it, in
+     * the union's order ({@link #over}), null for a table whose mapping
+     * declares no range field there; empty when one table is read.
+     */
+    private final List<InfinoRangeField> shards;
 
     private InfinoRangeField(String field, Declared declared, String table, Column from, Column to, Column fromList, Column toList) {
+        this(field, declared, table, from, to, fromList, toList, List.of());
+    }
+
+    private InfinoRangeField(
+        String field,
+        Declared declared,
+        String table,
+        Column from,
+        Column to,
+        Column fromList,
+        Column toList,
+        List<InfinoRangeField> shards
+    ) {
         this.field = field;
         this.type = declared.type();
         this.format = declared.format();
@@ -91,6 +125,7 @@ final class InfinoRangeField {
         this.to = to;
         this.fromList = fromList;
         this.toList = toList;
+        this.shards = shards;
     }
 
     /**
@@ -107,8 +142,11 @@ final class InfinoRangeField {
         Column from = cols.get(declared.path() + "." + FROM);
         Column to = cols.get(declared.path() + "." + TO);
         if (from == null || to == null) {
+            // An attached table, or one that held documents before range fields had columns: its
+            // rows written then would read as having no range, so the field is refused, not read.
             throw new IllegalArgumentException(
-                "[infino] a query on [" + field + "], a field of type [" + declared.type() + "], is not served: the table keeps it in _source only"
+                "[infino] a query on [" + field + "], a field of type [" + declared.type() + "], is not served: the table keeps it in _source only."
+                    + " An index written before range fields were kept as columns is served once it is reindexed into a new index"
             );
         }
         if (from.masked() || to.masked()) {
@@ -122,6 +160,37 @@ final class InfinoRangeField {
     /** Whether some document gives the field several ranges. */
     boolean multi() {
         return fromList != null && toList != null;
+    }
+
+    /**
+     * The field read over the union of {@code tables} as one relation
+     * ({@link InfinoAggregationProcessor#unionOf}), the first being this
+     * field's own table, each table's columns as {@code columnsOf} gives
+     * them: some document of any of them may give it several ranges, and a
+     * row's ranges are looked up in its own table. Itself when one table is
+     * read.
+     */
+    InfinoRangeField over(List<String> tables, Function<String, Map<String, Column>> columnsOf) {
+        if (tables.size() <= 1) {
+            return this;
+        }
+        List<InfinoRangeField> each = new ArrayList<>(tables.size());
+        Column lows = fromList;
+        Column highs = toList;
+        for (String t : tables) {
+            InfinoRangeField f = t.equals(table) ? this : of(t, columnsOf.apply(t), field);
+            if (f != null && !f.type.equals(type)) {
+                throw new IllegalArgumentException(
+                    "[infino] [" + field + "] is mapped as [" + type + "] and as [" + f.type + "] over the indices searched, which is not served"
+                );
+            }
+            if (f != null && lows == null && f.multi()) {
+                lows = f.fromList;
+                highs = f.toList;
+            }
+            each.add(f);
+        }
+        return new InfinoRangeField(field, new Declared(field, type, format), table, from, to, lows, highs, List.copyOf(each));
     }
 
     // ---- queries ----
@@ -166,7 +235,47 @@ final class InfinoRangeField {
         if (value == null) {
             throw new IllegalArgumentException("[infino] a term query on [" + field + "] needs a value");
         }
-        return range(value, value, true, true, ShapeRelation.INTERSECTS, null, null, now, columnValuesOnly);
+        return holdingAny(List.of(value), now, columnValuesOnly);
+    }
+
+    /**
+     * The rows a terms query on the field matches: a range holding any of
+     * {@code values}, each read as a term reads it. The documents with
+     * several ranges are read once for all the values, not once for each.
+     */
+    String holdingAny(List<?> values, long now, boolean columnValuesOnly) {
+        List<String[]> each = new ArrayList<>(values.size());
+        for (Object v : values) {
+            if (v == null) {
+                throw new IllegalArgumentException("[infino] a term query on [" + field + "] needs a value");
+            }
+            double[] q = bounds(v, v, true, true, format, null, now);
+            if (q != null) {
+                each.add(new String[] { literal(q[0]), literal(q[1]) });
+            }
+        }
+        if (each.isEmpty()) {
+            return InfinoQueryTranslator.NONE;
+        }
+        if (each.size() > MAX_INLINE_TERMS) {
+            if (columnValuesOnly) {
+                return null;
+            }
+            List<String> rows = new ArrayList<>(each.size());
+            for (String[] q : each) {
+                rows.add("(" + q[0] + ", " + q[1] + ")");
+            }
+            String list = "(VALUES " + String.join(", ", rows) + ") AS " + TERMS + "(" + TERM_LOW + ", " + TERM_HIGH + ")";
+            return pairs(false, (l, h) -> "EXISTS (SELECT 1 FROM " + list + " WHERE " + l + " <= " + TERMS + "." + TERM_HIGH + " AND " + h + " >= "
+                + TERMS + "." + TERM_LOW + ")");
+        }
+        return pairs(columnValuesOnly, (l, h) -> {
+            List<String> any = new ArrayList<>(each.size());
+            for (String[] q : each) {
+                any.add("(" + l + " <= " + q[1] + " AND " + h + " >= " + q[0] + ")");
+            }
+            return any.size() == 1 ? any.get(0) : "(" + String.join(" OR ", any) + ")";
+        });
     }
 
     /** The rows where the field has a value. */
@@ -186,6 +295,19 @@ final class InfinoRangeField {
         String own = test.apply(quoteIdent(from.name()), quoteIdent(to.name()));
         if (!multi()) {
             return own;
+        }
+        if (!shards.isEmpty()) {
+            // Over a union, each row's ranges are its own table's: a row is tested by its table's field.
+            StringBuilder out = new StringBuilder("(CASE ").append(quoteIdent(InfinoAggregationProcessor.SHARD_COLUMN));
+            for (int i = 0; i < shards.size(); i++) {
+                InfinoRangeField shard = shards.get(i);
+                String one = shard == null ? own : shard.pairs(columnValuesOnly, test);
+                if (one == null) {
+                    return null;
+                }
+                out.append(" WHEN ").append(i).append(" THEN (").append(one).append(")");
+            }
+            return out.append(" END)").toString();
         }
         if (columnValuesOnly) {
             return null;
@@ -216,6 +338,7 @@ final class InfinoRangeField {
             case DATE -> {
                 long lo = lower == null ? Long.MIN_VALUE : InfinoQueryTranslator.dateBoundMillis(lower, format, !includeLower, zone, now);
                 long hi = upper == null ? Long.MAX_VALUE : InfinoQueryTranslator.dateBoundMillis(upper, format, includeUpper, zone, now);
+                ordered(lo > hi, lo, hi);
                 if (lower != null && !includeLower) {
                     if (lo == Long.MAX_VALUE) {
                         return null;
@@ -231,13 +354,14 @@ final class InfinoRangeField {
                 return lo > hi ? null : new double[] { lo, hi };
             }
             case FLOAT -> {
-                double lo = lower == null ? -DOUBLE_LIMIT : decimal(lower).doubleValue();
-                double hi = upper == null ? DOUBLE_LIMIT : decimal(upper).doubleValue();
+                double lo = lower == null ? -DOUBLE_LIMIT : finite(lower);
+                double hi = upper == null ? DOUBLE_LIMIT : finite(upper);
+                ordered(lo > hi, single() ? (Object) (float) lo : (Object) lo, single() ? (Object) (float) hi : (Object) hi);
                 if (lower != null && !includeLower) {
-                    lo = Math.nextUp(lo);
+                    lo = single() ? Math.nextUp((float) lo) : Math.nextUp(lo);
                 }
                 if (upper != null && !includeUpper) {
-                    hi = Math.nextDown(hi);
+                    hi = single() ? Math.nextDown((float) hi) : Math.nextDown(hi);
                 }
                 return lo > hi ? null : new double[] { lo, hi };
             }
@@ -246,6 +370,7 @@ final class InfinoRangeField {
                 long max = "integer_range".equals(type) ? Integer.MAX_VALUE : Long.MAX_VALUE;
                 long lo = lower == null ? min : whole(lower, min, max);
                 long hi = upper == null ? max : whole(upper, min, max);
+                ordered(lo > hi, lo, hi);
                 if (lower != null && !includeLower) {
                     if (lo == max) {
                         return null;
@@ -261,6 +386,37 @@ final class InfinoRangeField {
                 return lo > hi ? null : new double[] { lo, hi };
             }
         }
+    }
+
+    /**
+     * Refuse a range query whose lower bound, as given, is above its upper
+     * one ({@code reversed}), as stock refuses it before it moves an
+     * exclusive bound: bounds given in the wrong order are the user's
+     * error, where bounds that only leave nothing once moved match nothing.
+     */
+    private static void ordered(boolean reversed, Object lo, Object hi) {
+        if (reversed) {
+            throw new IllegalArgumentException("Range query `from` value (" + lo + ") is greater than `to` value (" + hi + ")");
+        }
+    }
+
+    /** Whether the field keeps its values as floats, not doubles, as stock keeps a {@code float_range}. */
+    private boolean single() {
+        return "float_range".equals(type);
+    }
+
+    /**
+     * A query's number as the field keeps one: a {@code float_range} rounds
+     * it to a float, as stock does, so the column, which holds each float
+     * exactly as a double, compares with the same value. Refused when it
+     * is not finite, as stock refuses it.
+     */
+    private double finite(Object v) {
+        double d = single() ? (double) decimal(v).floatValue() : decimal(v).doubleValue();
+        if (Double.isInfinite(d) || Double.isNaN(d)) {
+            throw new IllegalArgumentException("[" + (single() ? "float" : "double") + "] supports only finite values, but got [" + v + "]");
+        }
+        return d;
     }
 
     /** A query's number, as stock parses a range field's bound. */

@@ -93,6 +93,27 @@ public class InfinoFetchFieldsTests extends OpenSearchTestCase {
         InfinoSearchChecks.checkTokenCountDocValues(new SearchSourceBuilder().fetchField("count_without_dv"), PROPERTIES);
     }
 
+    public void testFieldsReachingARangeFieldIsRefused() {
+        Map<String, Object> properties = Map.of(
+            "r",
+            Map.of("type", "long_range"),
+            "o",
+            Map.of("properties", Map.of("span", Map.of("type", "date_range"))),
+            "k",
+            Map.of("type", "keyword")
+        );
+        for (String field : List.of("r", "*", "r.*", "o.span", "o.*")) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> InfinoSearchChecks.checkRangeFetchFields(new SearchSourceBuilder().fetchField(field), properties)
+            );
+            assertTrue(e.getMessage(), e.getMessage().startsWith("[infino] fields [" + field + "] reaches ["));
+        }
+        InfinoSearchChecks.checkRangeFetchFields(new SearchSourceBuilder().fetchField("k"), properties);
+        // A search that returns no hits fetches no fields.
+        InfinoSearchChecks.checkRangeFetchFields(new SearchSourceBuilder().fetchField("r").size(0), properties);
+    }
+
     public void testNoStoredFieldsRefusesSourceAndFieldsAsStockDoes() {
         StoredFieldsContext none = StoredFieldsContext.fromList(List.of(StoredFieldsContext._NONE_));
         IllegalArgumentException source = expectThrows(

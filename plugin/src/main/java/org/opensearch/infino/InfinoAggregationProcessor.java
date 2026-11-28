@@ -209,7 +209,7 @@ public class InfinoAggregationProcessor {
     /** Stand-in for a missing key in a tuple's string form. */
     private static final String NULL_KEY = "\u0000";
     /** The column of {@link #unionOf} naming which shard's table a row came from. */
-    private static final String SHARD_COLUMN = "_infino_shard";
+    static final String SHARD_COLUMN = "_infino_shard";
     /** The alias of {@link #unionOf}'s relation. */
     private static final String UNION_ALIAS = "_infino_shards";
     /** The alias of a significant_terms level's background rows. */
@@ -484,7 +484,7 @@ public class InfinoAggregationProcessor {
         List<Spec> specs = new ArrayList<>();
         int position = 0;
         for (AggregationBuilder b : builders) {
-            specs.add(Spec.of(b, plan.cols(), plan.table(), predicates, plan.access(), position++, shardSized, plan.nowMillis()));
+            specs.add(Spec.of(b, plan.cols(), plan.table(), tables, predicates, plan.access(), position++, shardSized, plan.nowMillis()));
         }
         // A metric over a field some document gives several values reads each
         // document's figures over them, joined in once for the whole request.
@@ -679,7 +679,7 @@ public class InfinoAggregationProcessor {
      * over the rows keys every value a document has.
      */
     static String valuesRelation(String from, Collection<Source> multi) {
-        String relation = from;
+        String relation = aliasable(from);
         List<String> done = new ArrayList<>();
         for (Source s : multi) {
             if (done.contains(s.expr())) {
@@ -723,9 +723,18 @@ public class InfinoAggregationProcessor {
             + valuesRelation(from, multi) + " " + VALUE_ROWS + " WHERE " + where;
         String documents = metrics.isEmpty()
             ? ""
-            : " JOIN " + from + " " + BUCKET_DOCS + " ON " + BUCKET_DOCS + "." + InfinoQueryTranslator.OSID + " = " + BUCKET_KEYS + "." + BUCKET_DOC;
+            : " JOIN " + aliasable(from) + " " + BUCKET_DOCS + " ON " + BUCKET_DOCS + "." + InfinoQueryTranslator.OSID + " = " + BUCKET_KEYS + "." + BUCKET_DOC;
         return "SELECT " + String.join(", ", keys) + ", COUNT(*) AS doc_count" + tail + " FROM (" + perDocument + ") " + BUCKET_KEYS + documents + " GROUP BY "
             + positions + having;
+    }
+
+    /**
+     * {@code from} as a relation an alias may follow: a table as it is, and
+     * anything else, such as {@link #unionOf}'s relation, which carries an
+     * alias of its own, read through a subquery.
+     */
+    static String aliasable(String from) {
+        return from.startsWith("\"") ? from : "(SELECT * FROM " + from + ")";
     }
 
     // ---- servability (shared with the hit path's plan) ----
@@ -734,7 +743,7 @@ public class InfinoAggregationProcessor {
     static void check(Collection<AggregationBuilder> builders, Plan plan) {
         int position = 0;
         for (AggregationBuilder b : builders) {
-            Spec.of(b, plan.cols(), plan.table(), predicates(plan), plan.access(), position++, false, plan.nowMillis());
+            Spec.of(b, plan.cols(), plan.table(), List.of(plan.table()), predicates(plan), plan.access(), position++, false, plan.nowMillis());
         }
     }
 
@@ -784,12 +793,14 @@ public class InfinoAggregationProcessor {
          * {@link Unsupported} reason; {@code shardOfMany} as the processor's,
          * {@code now} the time {@code now} means in the request;
          * {@code predicates} turns an aggregation's own query into a
-         * predicate over the relation the aggregations read.
+         * predicate over the relation the aggregations read; {@code tables}
+         * are the tables that relation reads, {@code table} first.
          */
         static Spec of(
             AggregationBuilder b,
             Map<String, Column> cols,
             String table,
+            List<String> tables,
             Function<QueryBuilder, String> predicates,
             InfinoAccess access,
             int index,
@@ -817,7 +828,7 @@ public class InfinoAggregationProcessor {
             List<BucketSpec> children = new ArrayList<>();
             int i = 0;
             for (AggregationBuilder sub : b.getSubAggregations()) {
-                Spec s = of(sub, cols, table, predicates, access, i++, shardOfMany, now);
+                Spec s = of(sub, cols, table, tables, predicates, access, i++, shardOfMany, now);
                 if (s instanceof Metric m) {
                     metrics.add(m);
                 } else if (s instanceof TopHits t) {
@@ -832,10 +843,10 @@ public class InfinoAggregationProcessor {
                 return Grouped.terms(t, cols, table, leaves, child, shardOfMany, now);
             }
             if (b instanceof DateHistogramAggregationBuilder dh) {
-                return Grouped.dateHistogram(dh, cols, table, leaves, child, now);
+                return Grouped.dateHistogram(dh, cols, table, tables, leaves, child, now);
             }
             if (b instanceof HistogramAggregationBuilder h) {
-                return Grouped.histogram(h, cols, table, leaves, child, now);
+                return Grouped.histogram(h, cols, table, tables, leaves, child, now);
             }
             if (b instanceof FilterAggregationBuilder f) {
                 return Explicit.filter(f, predicates, leaves, child);
@@ -1742,6 +1753,12 @@ public class InfinoAggregationProcessor {
         final String orderTemplate;
         final DateKey date;
         final HistKey hist;
+        /**
+         * A loose range on the level's column that every row with a key
+         * passes, so the engine can skip the files that hold none (a date
+         * histogram's hard bounds); null when there is none.
+         */
+        final String within;
 
         private Grouped(
             AggregationBuilder b,
@@ -1757,6 +1774,24 @@ public class InfinoAggregationProcessor {
             DateKey date,
             HistKey hist
         ) {
+            this(b, leaves, child, source, keyExpr, keyKind, terms, size, minDocCount, orderTemplate, date, hist, null);
+        }
+
+        private Grouped(
+            AggregationBuilder b,
+            Leaves leaves,
+            BucketSpec child,
+            Source source,
+            String keyExpr,
+            KeyKind keyKind,
+            boolean terms,
+            int size,
+            long minDocCount,
+            String orderTemplate,
+            DateKey date,
+            HistKey hist,
+            String within
+        ) {
             super(b, leaves, child);
             this.source = source;
             this.keyExpr = keyExpr;
@@ -1767,6 +1802,7 @@ public class InfinoAggregationProcessor {
             this.orderTemplate = orderTemplate;
             this.date = date;
             this.hist = hist;
+            this.within = within;
             // A level's top hits are a window over the documents partitioned by its key,
             // which a document with several values would stand in once per value.
             if (source.multi() && !leaves.hits().isEmpty()) {
@@ -1831,6 +1867,7 @@ public class InfinoAggregationProcessor {
             DateHistogramAggregationBuilder dh,
             Map<String, Column> cols,
             String table,
+            List<String> tables,
             Leaves leaves,
             BucketSpec child,
             long now
@@ -1845,17 +1882,14 @@ public class InfinoAggregationProcessor {
                 : column.dateFormat();
             Long hardMin = dateBound(dh, "min", boundsFormat, tz, now);
             Long hardMax = dateBound(dh, "max", boundsFormat, tz, now);
-            Source c = rangeSource(dh, cols, table, now, (ranges, maxBuckets) -> {
+            Source c = rangeSource(dh, cols, table, tables, now, (ranges, maxBuckets) -> {
                 if (ranges.kind != InfinoRangeField.Kind.DATE) {
                     throw new Unsupported("aggregation [" + dh.getName() + "] needs a date value, [" + dh.field() + "] is of type [" + ranges.type + "]");
                 }
-                Rounding.Prepared rounding = dateExpr(dh.getName(), Source.unmapped(dh.field(), SqlType.DATE), tz, dh.getFixedInterval(), dh.getCalendarInterval(), dh.offset())
-                    .rounding()
-                    .prepareForUnknown();
                 double step = narrowestBucketMillis(dh.getFixedInterval(), dh.getCalendarInterval(), tz);
-                // A bucket the hard bounds keep starts at the lower one or after, and ends by the bucket after the upper one's.
+                // As stock: each range is cut to the hard bounds, both kept, and counts in every bucket what is left reaches.
                 Double low = hardMin == null ? null : (double) hardMin;
-                Double high = hardMax == null ? null : (double) (rounding.nextRoundingValue(rounding.round(hardMax)) - 1);
+                Double high = hardMax == null ? null : (double) hardMax;
                 long perBucket = (long) Math.ceil(widestBucketMillis(dh.getFixedInterval(), dh.getCalendarInterval()) / step);
                 return ranges.samples(dh.getName(), step, low, high, (maxBuckets + 1) * perBucket, maxBuckets);
             });
@@ -1863,14 +1897,29 @@ public class InfinoAggregationProcessor {
                 throw masked(dh, c);
             }
             DateExpr expr = dateExpr(dh.getName(), c, tz, dh.getFixedInterval(), dh.getCalendarInterval(), dh.offset());
-            if (hardMin != null || hardMax != null) {
-                // As stock: a bucket is kept when its key is inside the hard bounds.
+            String within = null;
+            if ((hardMin != null || hardMax != null) && declared == null && c.column() != null && c.isTimestamp() && !c.multi() && dh.missing() == null) {
+                // A key is never above its value, and a value is below the bucket after its key's:
+                // a row whose key the bounds keep is inside this range, on the column itself.
+                Rounding.Prepared prepared = expr.rounding().prepareForUnknown();
+                List<String> loose = new ArrayList<>();
+                if (hardMin != null) {
+                    loose.add(c.expr() + " >= " + timestampLiteral(hardMin));
+                }
+                if (hardMax != null) {
+                    loose.add(c.expr() + " < " + timestampLiteral(prepared.nextRoundingValue(prepared.round(hardMax - 1))));
+                }
+                within = String.join(" AND ", loose);
+            }
+            if ((hardMin != null || hardMax != null) && declared == null) {
+                // As stock: a bucket is kept when its key is at the lower hard bound or after,
+                // and before the upper one. A range field's ranges are cut to the bounds instead.
                 List<String> inside = new ArrayList<>();
                 if (hardMin != null) {
                     inside.add(expr.keyExpr() + " >= " + timestampLiteral(hardMin));
                 }
                 if (hardMax != null) {
-                    inside.add(expr.keyExpr() + " <= " + timestampLiteral(hardMax));
+                    inside.add(expr.keyExpr() + " < " + timestampLiteral(hardMax));
                 }
                 expr = new DateExpr("CASE WHEN " + String.join(" AND ", inside) + " THEN " + expr.keyExpr() + " END", expr.rounding());
             }
@@ -1888,17 +1937,25 @@ public class InfinoAggregationProcessor {
                 bounds = new LongBounds(min == null ? null : prepared.round(min), max == null ? null : prepared.round(max));
             }
             DateKey date = new DateKey(format, expr.rounding(), bounds, dh.keyed(), dh.offset());
-            return new Grouped(dh, leaves, child, c, expr.keyExpr(), KeyKind.DATE, false, Integer.MAX_VALUE, dh.minDocCount(), "{key} ASC", date, null);
+            return new Grouped(dh, leaves, child, c, expr.keyExpr(), KeyKind.DATE, false, Integer.MAX_VALUE, dh.minDocCount(), "{key} ASC", date, null, within);
         }
 
-        static Grouped histogram(HistogramAggregationBuilder h, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child, long now) {
+        static Grouped histogram(
+            HistogramAggregationBuilder h,
+            Map<String, Column> cols,
+            String table,
+            List<String> tables,
+            Leaves leaves,
+            BucketSpec child,
+            long now
+        ) {
             DoubleBounds hardBounds = histBounds(h, Histogram.HARD_BOUNDS_FIELD.getPreferredName());
-            Source c = rangeSource(h, cols, table, now, (ranges, maxBuckets) -> {
+            Source c = rangeSource(h, cols, table, tables, now, (ranges, maxBuckets) -> {
                 // Every bucket is the interval wide: one value per interval reaches each.
+                // As stock: each range is cut to the hard bounds, both kept.
                 double interval = h.interval();
-                Double low = hardBounds == null || hardBounds.getMin() == null ? null : hardBounds.getMin() + h.offset();
-                Double high = hardBounds == null || hardBounds.getMax() == null ? null
-                    : (Math.floor(hardBounds.getMax() / interval) + 1) * interval + h.offset();
+                Double low = hardBounds == null ? null : hardBounds.getMin();
+                Double high = hardBounds == null ? null : hardBounds.getMax();
                 return ranges.samples(h.getName(), interval, low, high, maxBuckets + 1, maxBuckets);
             });
             if (c.masked()) {
@@ -1909,6 +1966,7 @@ public class InfinoAggregationProcessor {
                 throw new Unsupported("aggregation [" + h.getName() + "] has an order other than by key");
             }
             DoubleBounds hard = hardBounds;
+            boolean ranged = c.values() != null && c.values().samples() != null;
             if (hard != null) {
                 checkInside(hard, histBounds(h, Histogram.EXTENDED_BOUNDS_FIELD.getPreferredName()));
                 // As stock: a bucket is kept when its start, before the offset is added back,
@@ -1921,7 +1979,8 @@ public class InfinoAggregationProcessor {
                 if (hard.getMax() != null) {
                     inside.add(start + " <= " + hard.getMax());
                 }
-                if (!inside.isEmpty()) {
+                // A range field's ranges are cut to the bounds instead, as stock cuts them.
+                if (!inside.isEmpty() && !ranged) {
                     keyExpr = "CASE WHEN " + String.join(" AND ", inside) + " THEN " + keyExpr + " END";
                 }
             }
@@ -1945,13 +2004,22 @@ public class InfinoAggregationProcessor {
          * What a histogram reads ({@link #sourceOf}), or for a range field
          * ({@link InfinoRangeField}) the values {@code sampling} reads from
          * each document's ranges, so the document counts once in each bucket
-         * a range of it reaches, as stock counts it.
+         * a range of it reaches, as stock counts it. Over several
+         * {@code tables} read as one relation, every table's ranges are read.
          */
-        static Source rangeSource(ValuesSourceAggregationBuilder<?> b, Map<String, Column> cols, String table, long now, RangeSampling sampling) {
+        static Source rangeSource(
+            ValuesSourceAggregationBuilder<?> b,
+            Map<String, Column> cols,
+            String table,
+            List<String> tables,
+            long now,
+            RangeSampling sampling
+        ) {
             InfinoRangeField ranges = b.field() == null || b.script() != null ? null : InfinoRangeField.of(table, cols, b.field());
             if (ranges == null) {
                 return sourceOf(b, cols, table, now);
             }
+            ranges = ranges.over(tables, InfinoNative::columns);
             if (b.missing() != null) {
                 throw new Unsupported("aggregation [" + b.getName() + "] has [missing] over the range field [" + b.field() + "], which is not served");
             }
@@ -4431,7 +4499,7 @@ public class InfinoAggregationProcessor {
             }
         }
         String metrics = level.metrics.isEmpty() ? "" : metricColumns(level.metrics);
-        String keep = present ? " AND " + presence(level.keyExpr, level.source) : "";
+        String keep = (present ? " AND " + presence(level.keyExpr, level.source) : "") + (level.within == null ? "" : " AND " + level.within);
         String having = level.minDocCount > 1 ? " HAVING COUNT(*) >= " + level.minDocCount : "";
         return groupStatement(keyCols, metrics, from, where + restriction + keep, multi, having);
     }

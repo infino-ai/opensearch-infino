@@ -272,7 +272,7 @@ mget/20_stored_fields/Stored fields  # [gap] not served: stored_fields; the tabl
 get/70_source_filtering/Source filtering  # [gap] not served: stored_fields; the table keeps no stored fields
 search/200_ignore_malformed/_ignored is still returned with explicit list of stored fields  # [gap] not served: stored_fields; the table keeps no stored fields
 search/330_fetch_fields/Test disable _source loading  # [gap] not served: stored_fields; the table keeps no stored fields
-search/330_fetch_fields/Test basic field retrieval  # [gap] fields on a range field: its value is read from the source flattened, which splits a range into its bounds
+search/330_fetch_fields/Test basic field retrieval  # [gap] not served: fields on a range field, refused as a bad request
 search/350_matched_queries/*  # [gap] not served: matched_queries
 search/40_indices_boost/Indices boost using object  # [gap] not served: indices_boost
 search/40_indices_boost/Indices boost using array  # [gap] not served: indices_boost

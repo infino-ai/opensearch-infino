@@ -42,7 +42,7 @@ public class InfinoHistogramOnDateTests extends OpenSearchTestCase {
     }
 
     private static Grouped histogram(HistogramAggregationBuilder h) {
-        return Grouped.histogram(h, columns(), "t", Leaves.NONE, null, 0L);
+        return Grouped.histogram(h, columns(), "t", List.of("t"), Leaves.NONE, null, 0L);
     }
 
     private static InternalHistogram built(Grouped g, double... keys) {
@@ -129,7 +129,7 @@ public class InfinoHistogramOnDateTests extends OpenSearchTestCase {
         CompositeAggregationBuilder c = new CompositeAggregationBuilder("c", sources);
         IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> InfinoAggregationProcessor.Composite.of(c, columns(), "t", Leaves.NONE, null, 0L)
+            () -> InfinoAggregationProcessor.Composite.of(c, columns(), "t", List.of("t"), Leaves.NONE, null, 0L)
         );
         assertTrue(e.getMessage(), e.getMessage().contains("needs a numeric value, [ts] is date"));
     }

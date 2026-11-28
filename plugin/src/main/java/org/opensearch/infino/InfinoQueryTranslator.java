@@ -3449,20 +3449,7 @@ final class InfinoQueryTranslator {
 
     /** The rows a terms query on a range field matches: a range holding any of {@code values}. */
     private String rangesHolding(InfinoRangeField ranges, List<Object> values) {
-        if (values == null || values.isEmpty()) {
-            return NONE;
-        }
-        List<String> any = new ArrayList<>(values.size());
-        for (Object v : values) {
-            String one = ranges.term(v, nowMillis, columnValuesOnly);
-            if (one == null) {
-                return null;
-            }
-            if (!one.equals(NONE)) {
-                any.add(one);
-            }
-        }
-        return any.isEmpty() ? NONE : "(" + String.join(" OR ", any) + ")";
+        return values == null || values.isEmpty() ? NONE : ranges.holdingAny(values, nowMillis, columnValuesOnly);
     }
 
     private String range(RangeQueryBuilder r) {
