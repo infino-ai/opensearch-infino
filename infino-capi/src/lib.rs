@@ -3241,6 +3241,9 @@ fn conform(value: Value, dt: &DataType) -> Result<Value, String> {
                     "{n} is past the whole numbers a float holds exactly, so it is no integer"
                 )),
             },
+            // An empty string is no value, as OpenSearch's number mappers
+            // read it under `coerce` (the default).
+            Value::String(s) if s.is_empty() => Ok(Value::Null),
             Value::String(s) => s
                 .trim()
                 .parse::<i64>()
@@ -3253,6 +3256,7 @@ fn conform(value: Value, dt: &DataType) -> Result<Value, String> {
         },
         DataType::Float64 => match &value {
             Value::Number(_) => Ok(value),
+            Value::String(s) if s.is_empty() => Ok(Value::Null),
             Value::String(s) => s
                 .trim()
                 .parse::<f64>()
@@ -3267,7 +3271,9 @@ fn conform(value: Value, dt: &DataType) -> Result<Value, String> {
             Value::Bool(_) => Ok(value),
             Value::String(s) => match s.as_str() {
                 "true" => Ok(json!(true)),
-                "false" => Ok(json!(false)),
+                // OpenSearch reads an empty string as false: its parser's
+                // `booleanValue` falls back to false for no text.
+                "false" | "" => Ok(json!(false)),
                 _ => Err(format!("'{s}' is not a boolean")),
             },
             _ => Err("not a boolean".into()),
@@ -11057,6 +11063,19 @@ mod tests {
         let hits = sql(h, r#"SELECT osid FROM logs WHERE array_has("n[]", 2)"#);
         assert_eq!(hits, json!([{ "osid": "m1" }]), "{hits}");
         close(h);
+    }
+
+    /// An empty string is no value in a number column and false in a
+    /// boolean one, as OpenSearch reads it; a blank one is still refused.
+    #[test]
+    fn an_empty_string_is_no_number_and_false() {
+        assert_eq!(conform(json!(""), &DataType::Int64), Ok(Value::Null));
+        assert_eq!(conform(json!(""), &DataType::Float64), Ok(Value::Null));
+        assert_eq!(conform(json!(""), &DataType::Boolean), Ok(json!(false)));
+        assert!(conform(json!(" "), &DataType::Int64).is_err());
+        assert!(conform(json!(" "), &DataType::Float64).is_err());
+        assert!(conform(json!(" "), &DataType::Boolean).is_err());
+        assert_eq!(conform(json!("42"), &DataType::Int64), Ok(json!(42)));
     }
 
     /// How many short values the keyword array below holds, and the bytes of
