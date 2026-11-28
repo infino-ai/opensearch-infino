@@ -533,7 +533,17 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertArrayEquals(
             new Object[] { Long.MAX_VALUE, Long.MIN_VALUE, Double.POSITIVE_INFINITY, "a", null },
             InfinoQueryPhaseSearcher.searchAfter(
-                new Object[] { Long.MAX_VALUE, Long.MIN_VALUE, Double.POSITIVE_INFINITY, new org.apache.lucene.util.BytesRef("a"), null }
+                new Object[] { Long.MAX_VALUE, Long.MIN_VALUE, Double.POSITIVE_INFINITY, new org.apache.lucene.util.BytesRef("a"), null },
+                List.of()
+            )
+        );
+        // An ip field's address, carried in its 16-byte form, resumes as the address.
+        InfinoSearch.SortSpec ip = new InfinoSearch.SortSpec("k", "addr", InfinoScriptTranslator.SqlType.STRING, false, false, false, false, true);
+        assertArrayEquals(
+            new Object[] { "10.1.2.3", "2001:db8::1" },
+            InfinoQueryPhaseSearcher.searchAfter(
+                new Object[] { InfinoIp.encoded("::ffff:10.1.2.3"), InfinoIp.encoded("2001:DB8::1") },
+                List.of(ip, ip)
             )
         );
         assertFalse(statusSort(org.opensearch.search.sort.SortOrder.ASC, Long.MAX_VALUE).get(0).missingStandIn(Long.MAX_VALUE));
@@ -2836,6 +2846,45 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         expectThrows(IllegalArgumentException.class, () -> typedWhere(QueryBuilders.termQuery("ip", "10.0.0.0/33")));
         // On a keyword field the text is the value.
         assertEquals("\"level\" = 'a/8'", typedWhere(QueryBuilders.termQuery("level", "a/8")));
+    }
+
+    /**
+     * A range on an ip field compares each address's key, the hex of its
+     * 16-byte form, not its text: as text, 1.0.179.100 sorts before
+     * 1.0.6.192, and 100.0.0.0 lies between 10.0.0.0 and 10.255.255.255.
+     */
+    public void testARangeOnAnIpFieldComparesAddressKeys() {
+        String key = InfinoIp.key("\"ip\"");
+        assertEquals(
+            "(" + key + " BETWEEN '00000000000000000000ffff0a000000' AND '00000000000000000000ffff0affffff')",
+            typedWhere(QueryBuilders.rangeQuery("ip").gte("10.0.0.0").lte("10.255.255.255"))
+        );
+        // An exclusive bound is the next address inclusive, as stock reads it.
+        assertEquals("(" + key + " >= '00000000000000000000ffff64000001')", typedWhere(QueryBuilders.rangeQuery("ip").gt("100.0.0.0")));
+        assertEquals("(" + key + " <= '20010db8000000000000000000000000')", typedWhere(QueryBuilders.rangeQuery("ip").lt("2001:DB8::1")));
+        // Past the greatest address, or before the least, there is none.
+        assertEquals(InfinoQueryTranslator.NONE, typedWhere(QueryBuilders.rangeQuery("ip").gt("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")));
+        assertEquals(InfinoQueryTranslator.NONE, typedWhere(QueryBuilders.rangeQuery("ip").lt("::")));
+        // An IPv4-mapped bound is its IPv4 address.
+        assertEquals(
+            typedWhere(QueryBuilders.rangeQuery("ip").gte("10.0.0.0")),
+            typedWhere(QueryBuilders.rangeQuery("ip").gte("::ffff:10.0.0.0"))
+        );
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> typedWhere(QueryBuilders.rangeQuery("ip").gte("10.0.0")));
+        assertEquals("'10.0.0' is not an IP string literal.", e.getMessage());
+    }
+
+    /** An address's key and back: the hex of its 16-byte form, printed as stock prints it. */
+    public void testAddressKeys() {
+        assertEquals("00000000000000000000ffff01000692", InfinoIp.keyOf("1.0.6.146"));
+        assertEquals(InfinoIp.keyOf("1.2.3.4"), InfinoIp.keyOf("::ffff:1.2.3.4"));
+        assertEquals("00000000000000000000000000000001", InfinoIp.keyOf("::1"));
+        assertEquals("1.2.3.4", InfinoIp.shown(InfinoIp.keyOf("::FFFF:1.2.3.4")));
+        assertEquals("2001:db8::1", InfinoIp.shown(InfinoIp.keyOf("2001:0DB8:0000:0000:0000:0000:0000:0001")));
+        assertEquals("2001:db8::1", InfinoIp.shownEncoded(InfinoIp.encoded("2001:db8::1")));
+        assertTrue(InfinoIp.keyOf("1.0.6.192").compareTo(InfinoIp.keyOf("1.0.179.100")) < 0);
+        assertTrue(InfinoIp.keyOf("255.255.255.255").compareTo(InfinoIp.keyOf("2001:db8::")) < 0);
+        assertTrue(InfinoIp.keyOf("::1").compareTo(InfinoIp.keyOf("0.0.0.0")) < 0);
     }
 
     /**

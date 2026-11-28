@@ -5,6 +5,7 @@
 package org.opensearch.infino;
 
 import org.apache.lucene.document.InetAddressPoint;
+import org.apache.lucene.util.BytesRef;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.network.InetAddresses;
 import org.opensearch.common.network.NetworkAddress;
@@ -13,6 +14,7 @@ import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.util.Arrays;
 import java.util.HexFormat;
+import java.util.Locale;
 
 /**
  * An {@code ip} field's addresses, compared as stock compares them. Stock
@@ -26,6 +28,13 @@ import java.util.HexFormat;
  * block compares a key the statement computes from the text ({@link #key}):
  * the 16 bytes as 32 lowercase hex digits, which compare as text in the
  * order the bytes compare as numbers, so a block is a range of keys.
+ *
+ * <p>Every range, sort and key order on the field compares the same key, so
+ * addresses order as stock orders them: as numbers, an IPv4 address as its
+ * IPv4-mapped IPv6 address, where text would put {@code 1.0.179.100} before
+ * {@code 1.0.6.192}. A query's address becomes the same digits
+ * ({@link #keyLiteral}), and a key read back becomes the address as stock
+ * prints it ({@link #shown}).
  */
 final class InfinoIp {
     private InfinoIp() {}
@@ -38,6 +47,9 @@ final class InfinoIp {
 
     /** The bits of an IPv4 address's 16-byte form before its own 32: its prefix length there is 96 more. */
     private static final int MAPPED_BITS = 96;
+
+    /** The hex digits of one address's 16 bytes. */
+    private static final int KEY_DIGITS = 32;
 
     private static final HexFormat HEX = HexFormat.of();
 
@@ -71,7 +83,7 @@ final class InfinoIp {
         if (a == null) {
             return false;
         }
-        String key = HEX.formatHex(InetAddressPoint.encode(a));
+        String key = keyOf(a);
         String[] range = blockKeys(block);
         return key.compareTo(range[0]) >= 0 && key.compareTo(range[1]) <= 0;
     }
@@ -140,6 +152,86 @@ final class InfinoIp {
         String full = "CASE WHEN strpos(" + inner + ", '::') = 0 THEN " + inner + " ELSE replace(" + inner + ", '::', (':' || repeat('0:', " + GROUPS
             + " - " + colons + "))) END";
         return "regexp_replace(regexp_replace((':' || " + full + "), ':', ':000', 'g'), ':[0-9a-f]*([0-9a-f]{4})', '\\1', 'g')";
+    }
+
+    /**
+     * The key of the address {@code value} as an SQL literal, read as stock
+     * reads an address in a query; one that is not an address is refused
+     * with stock's message.
+     */
+    static String keyLiteral(Object value) {
+        return "'" + keyOf(value) + "'";
+    }
+
+    /** The key of the address {@code value}: the hex digits of its 16-byte form. */
+    static String keyOf(Object value) {
+        return HEX.formatHex(bytesOf(value));
+    }
+
+    /**
+     * The key of the least address a range's lower bound {@code value}
+     * admits, as stock reads the bound: the address itself when
+     * {@code inclusive}, else the one after it; null when it admits none
+     * (past the greatest address).
+     */
+    static String lowerKey(Object value, boolean inclusive) {
+        InetAddress address = InetAddresses.forString(text(value));
+        if (inclusive) {
+            return keyOf(address);
+        }
+        return address.equals(InetAddressPoint.MAX_VALUE) ? null : keyOf(InetAddressPoint.nextUp(address));
+    }
+
+    /** As {@link #lowerKey}, the greatest address a range's upper bound admits; null before the least address. */
+    static String upperKey(Object value, boolean inclusive) {
+        InetAddress address = InetAddresses.forString(text(value));
+        if (inclusive) {
+            return keyOf(address);
+        }
+        return address.equals(InetAddressPoint.MIN_VALUE) ? null : keyOf(InetAddressPoint.nextDown(address));
+    }
+
+    private static String keyOf(InetAddress address) {
+        return HEX.formatHex(InetAddressPoint.encode(address));
+    }
+
+    /**
+     * The 16-byte form of the address {@code value} (text, as a query or a
+     * hit writes it), the bytes stock sorts and buckets an ip field by.
+     */
+    static BytesRef encoded(Object value) {
+        return new BytesRef(bytesOf(value));
+    }
+
+    /** The 16-byte form of the address a key holds. */
+    static BytesRef encodedKey(Object key) {
+        return new BytesRef(HEX.parseHex(checked(key)));
+    }
+
+    /** The address a key holds, as stock prints it ({@code 1.2.3.4}, or IPv6 compressed). */
+    static String shown(Object key) {
+        return NetworkAddress.format(InetAddressPoint.decode(HEX.parseHex(checked(key))));
+    }
+
+    /** The address in {@code encoded}, an address's 16-byte form, as stock prints it. */
+    static String shownEncoded(BytesRef encoded) {
+        return NetworkAddress.format(InetAddressPoint.decode(BytesRef.deepCopyOf(encoded).bytes));
+    }
+
+    private static byte[] bytesOf(Object value) {
+        return InetAddressPoint.encode(InetAddresses.forString(text(value)));
+    }
+
+    private static String text(Object value) {
+        return value instanceof BytesRef b ? b.utf8ToString() : value.toString();
+    }
+
+    private static String checked(Object key) {
+        String text = key.toString().toLowerCase(Locale.ROOT);
+        if (text.length() != KEY_DIGITS) {
+            throw new IllegalStateException("[infino] [" + key + "] is not an address key");
+        }
+        return text;
     }
 
     /** The address {@code value} spells, as stock reads one in a query; null for text that is not one. */
