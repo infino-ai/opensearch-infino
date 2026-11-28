@@ -5,11 +5,13 @@
 package org.opensearch.infino;
 
 import org.apache.lucene.document.InetAddressPoint;
+import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.automaton.CharacterRunAutomaton;
 import org.apache.lucene.util.automaton.Operations;
 import org.apache.lucene.util.automaton.RegExp;
 import org.opensearch.common.network.InetAddresses;
 import org.opensearch.infino.InfinoAggregationProcessor.Unsupported;
+import org.opensearch.infino.InfinoIncludeExclude.KeyFilter;
 import org.opensearch.infino.InfinoIncludeExclude.KeyType;
 import org.opensearch.search.aggregations.AggregationExecutionException;
 import org.opensearch.test.OpenSearchTestCase;
@@ -160,6 +162,12 @@ public class InfinoIncludeExcludeTests extends OpenSearchTestCase {
         for (String subject : subjects) {
             assertEquals("[" + pattern + "] as [" + translated + "] on [" + subject + "]", lucene(pattern, subject), p.matcher(subject).matches());
         }
+        // The key test serves it, with stock's own filter keeping what Lucene keeps.
+        KeyFilter f = filter(Map.of("include", pattern), KeyType.KEYWORD);
+        for (String subject : subjects) {
+            boolean kept = f.test() == null || f.strings().accept(new BytesRef(subject));
+            assertEquals("[" + pattern + "] on [" + subject + "]", lucene(pattern, subject), kept);
+        }
     }
 
     public void testRegularExpressionsMatchWhatLuceneMatches() {
@@ -198,10 +206,59 @@ public class InfinoIncludeExcludeTests extends OpenSearchTestCase {
         assertTrue(and.getMessage(), and.getMessage().contains("intersection"));
         expectThrows(Unsupported.class, () -> InfinoIncludeExclude.anchored("#"));
         expectThrows(Unsupported.class, () -> InfinoIncludeExclude.anchored("<1-10>"));
-        expectThrows(Unsupported.class, () -> InfinoIncludeExclude.anchored("a{1001}"));
         expectThrows(Unsupported.class, () -> InfinoIncludeExclude.anchored("(".repeat(150) + "a" + ")".repeat(150)));
-        IllegalArgumentException tooLong = expectThrows(IllegalArgumentException.class, () -> InfinoIncludeExclude.anchored("a".repeat(1001)));
-        assertTrue(tooLong.getMessage(), tooLong.getMessage().contains("index.max_regex_length"));
+    }
+
+    public void testRepetitionsAreBoundedByWhatTheyStandForWrittenOut() {
+        // Each repetition alone is small; written out they are a million characters.
+        Unsupported nested = expectThrows(Unsupported.class, () -> InfinoIncludeExclude.anchored("(a{1000}){1000}"));
+        assertTrue(nested.getMessage(), nested.getMessage().contains("once its repetitions are written out"));
+        expectThrows(Unsupported.class, () -> InfinoIncludeExclude.anchored("(ab{100}){100}"));
+        expectThrows(Unsupported.class, () -> InfinoIncludeExclude.anchored("a{10001}"));
+        expectThrows(Unsupported.class, () -> InfinoIncludeExclude.anchored("a{99999999999}"));
+        expectThrows(Unsupported.class, () -> InfinoIncludeExclude.anchored("(a{100}){100,}"));
+        assertTrue(Pattern.compile(InfinoIncludeExclude.anchored("(a{100}){99}")).matcher("a".repeat(9900)).matches());
+        assertTrue(Pattern.compile(InfinoIncludeExclude.anchored("a{1001}")).matcher("a".repeat(1001)).matches());
+        // A class counts once per range it keeps: \W keeps five.
+        expectThrows(Unsupported.class, () -> InfinoIncludeExclude.anchored("(\\W{100}){100}"));
+        expectThrows(Unsupported.class, () -> InfinoIncludeExclude.anchored("[^ac]{5000}"));
+        assertTrue(Pattern.compile(InfinoIncludeExclude.anchored("\\W{2000}")).matcher("-".repeat(2000)).matches());
+    }
+
+    /**
+     * A pattern is served only where this release's Lucene reads it as the
+     * translation does. Two readings changed between Lucene releases the
+     * plugin builds for: {@code ~} is a complement on Lucene 9 and a plain
+     * character on Lucene 10, and an escaped character before {@code -} in a
+     * class starts a range up to Lucene 10.1 and is one character after it.
+     */
+    public void testAPatternThisReleaseReadsOtherwiseIsRefused() {
+        boolean complement = lucene("~a", "b");
+        if (complement) {
+            Unsupported refused = expectThrows(Unsupported.class, () -> filter(Map.of("include", "~(ap.*)"), KeyType.KEYWORD));
+            assertTrue(refused.getMessage(), refused.getMessage().contains("reads differently"));
+        } else {
+            KeyFilter f = filter(Map.of("include", "~(ap.*)"), KeyType.KEYWORD);
+            assertTrue(f.strings().accept(new BytesRef("~apple")));
+            assertFalse(f.strings().accept(new BytesRef("banana")));
+        }
+        String escapedRange = "[\\.-_]+";
+        if (lucene(escapedRange, "A1")) {
+            expectThrows(Unsupported.class, () -> filter(Map.of("include", escapedRange), KeyType.KEYWORD));
+        } else {
+            KeyFilter f = filter(Map.of("include", escapedRange), KeyType.KEYWORD);
+            assertTrue(f.strings().accept(new BytesRef("-._")));
+            assertFalse(f.strings().accept(new BytesRef("A1")));
+        }
+    }
+
+    public void testAnIncludeOfEveryStringIsNoTest() {
+        // Dashboards' suggestion request for an empty box.
+        assertSame(KeyFilter.ALL, filter(Map.of("include", ".*"), KeyType.KEYWORD));
+        assertSame(KeyFilter.ALL, filter(Map.of("include", "@"), KeyType.KEYWORD));
+        assertSame(KeyFilter.ALL, filter(Map.of("include", "(.|a)*"), KeyType.KEYWORD));
+        assertNotNull(filter(Map.of("include", ".*", "exclude", "a"), KeyType.KEYWORD).test());
+        assertNotNull(filter(Map.of("include", ".+"), KeyType.KEYWORD).test());
     }
 
     // ---- ip addresses ----
@@ -288,8 +345,12 @@ public class InfinoIncludeExcludeTests extends OpenSearchTestCase {
 
     // ---- the key test ----
 
-    private static UnaryOperator<String> test(Map<String, Object> body, KeyType type) {
+    private static KeyFilter filter(Map<String, Object> body, KeyType type) {
         return InfinoIncludeExclude.keyTest("t", body, type);
+    }
+
+    private static UnaryOperator<String> test(Map<String, Object> body, KeyType type) {
+        return filter(body, type).test();
     }
 
     public void testValuesAreReadAsTheFieldReadsThem() {
@@ -298,9 +359,24 @@ public class InfinoIncludeExcludeTests extends OpenSearchTestCase {
         assertEquals("(CAST(k AS DOUBLE) IN (1.5))", test(Map.of("include", List.of("1.5")), KeyType.DOUBLE).apply("k"));
         assertEquals("(k IN (true) AND NOT k IN (false))", test(Map.of("include", List.of("true"), "exclude", List.of("false")), KeyType.BOOLEAN).apply("k"));
         assertEquals("(FALSE)", test(Map.of("include", List.of()), KeyType.KEYWORD).apply("k"));
+        assertEquals("(FALSE)", test(Map.of("include", List.of()), KeyType.IP).apply("k"));
+        assertFalse(filter(Map.of("include", List.of()), KeyType.KEYWORD).strings().accept(new BytesRef("a")));
+        assertTrue(filter(Map.of("include", List.of("a")), KeyType.KEYWORD).strings().accept(new BytesRef("a")));
+        assertFalse(filter(Map.of("exclude", List.of("a")), KeyType.KEYWORD).strings().accept(new BytesRef("a")));
         assertTrue(test(Map.of("exclude", List.of("0.0.0.0")), KeyType.IP).apply("k").startsWith("(NOT regexp_like(k, '^(?:"));
         String both = test(Map.of("include", "a.*", "exclude", "ab"), KeyType.KEYWORD).apply("k");
         assertEquals("(regexp_like(k, '^(?:a(?:(?s:.))*)$') AND NOT regexp_like(k, '^(?:ab)$'))", both);
+    }
+
+    public void testAnEmptyListOfNumbersIsNoList() {
+        // Stock's long filter keeps every value when given no values to include.
+        for (KeyType type : List.of(KeyType.LONG, KeyType.DOUBLE, KeyType.BOOLEAN, KeyType.DATE)) {
+            assertSame(type.toString(), KeyFilter.ALL, filter(Map.of("include", List.of()), type));
+        }
+        for (KeyType type : KeyType.values()) {
+            assertSame(type.toString(), KeyFilter.ALL, filter(Map.of("exclude", List.of()), type));
+        }
+        assertEquals("(NOT k IN (1))", test(Map.of("include", List.of(), "exclude", List.of(1)), KeyType.LONG).apply("k"));
     }
 
     public void testMalformedValuesAreRefusedAsStockRefusesThem() {

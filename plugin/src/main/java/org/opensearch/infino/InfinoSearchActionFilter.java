@@ -6,6 +6,7 @@ package org.opensearch.infino;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.util.automaton.TooComplexToDeterminizeException;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.search.SearchAction;
 import org.opensearch.action.search.SearchRequest;
@@ -192,7 +193,7 @@ public class InfinoSearchActionFilter extends InfinoActionFilter {
         // The shards never see the search as written, so they cannot make their checks of it.
         try {
             InfinoSearchChecks.check(search.source(), served, clusters.getClusterSettings().get(SearchService.ALLOW_EXPENSIVE_QUERIES));
-        } catch (IllegalArgumentException e) {
+        } catch (IllegalArgumentException | TooComplexToDeterminizeException e) {
             listener.onFailure(e);
             return;
         }

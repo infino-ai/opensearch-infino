@@ -5,12 +5,20 @@
 package org.opensearch.infino;
 
 import org.apache.lucene.document.InetAddressPoint;
+import org.apache.lucene.util.automaton.Automata;
+import org.apache.lucene.util.automaton.Automaton;
+import org.apache.lucene.util.automaton.Operations;
+import org.apache.lucene.util.automaton.RegExp;
+import org.apache.lucene.util.automaton.TooComplexToDeterminizeException;
 import org.opensearch.common.network.InetAddresses;
 import org.opensearch.infino.InfinoAggregationProcessor.Unsupported;
+import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.AggregationExecutionException;
+import org.opensearch.search.aggregations.bucket.terms.IncludeExclude;
 
 import java.net.InetAddress;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.function.UnaryOperator;
@@ -29,19 +37,29 @@ import static org.opensearch.infino.InfinoQueryTranslator.literal;
  * written, an ip's address (any way it is written), a number's value, a
  * boolean's truth. A string is a Lucene regular expression over a keyword's
  * whole value, translated to the engine's regular expressions construct by
- * construct; one it cannot translate exactly is refused, never approximated.
- * The partitioned form ({@code partition}, {@code num_partitions}) splits
+ * construct. Stock's own automaton for the pattern, built by the Lucene of
+ * the running release, is the reference: an include that keeps every string
+ * is no test at all, and a translation whose language differs from it (a
+ * construct this release's Lucene reads in a way the translation does not,
+ * such as {@code ~} on a release where it is a complement) is refused, never
+ * approximated. The partitioned form ({@code partition}, {@code num_partitions}) splits
  * terms by a hash the engine has no function for, and is refused.
  */
 final class InfinoIncludeExclude {
 
     private InfinoIncludeExclude() {}
 
-    /** Stock's default {@code index.max_regex_length}, the longest include or exclude pattern it reads. */
-    static final int MAX_REGEX_LENGTH = 1000;
+    /**
+     * The most characters a pattern may stand for once its repetitions are
+     * written out ({@code (a{100}){100}} stands for 10000), a class counting
+     * as one character per range it keeps ({@code \W} as five): the engine
+     * compiles each repetition as a copy, and past this its compiled pattern
+     * nears the engine's size limit.
+     */
+    static final long MAX_EXPANDED_SIZE = 10_000;
 
-    /** The largest count a pattern's {@code {n,m}} repetition may give; past it the engine's compiled pattern grows too large. */
-    static final int MAX_REPEAT = 1000;
+    /** How much work Lucene may spend determinizing a pattern's automaton, as stock's include spends. */
+    private static final int DETERMINIZE_WORK_LIMIT = Operations.DEFAULT_DETERMINIZE_WORK_LIMIT;
 
     /**
      * How deep the translation of a pattern may nest its groups (each
@@ -83,11 +101,24 @@ final class InfinoIncludeExclude {
     }
 
     /**
-     * The test {@code body}'s include and exclude make of a key expression of
-     * {@code type}, for aggregation {@code agg}: a SQL predicate true where the
-     * key is kept. {@code body} is the terms aggregation's own JSON body.
+     * What a terms level's include/exclude makes of its key. {@code test} is a
+     * SQL predicate over a key expression, true where the key is kept; null
+     * when every key is kept, so the level reads as one with no
+     * include/exclude. {@code strings} is stock's own filter over a keyword
+     * key's bytes, for keys read outside a statement; null for keys of other
+     * types.
      */
-    static UnaryOperator<String> keyTest(String agg, Map<String, Object> body, KeyType type) {
+    record KeyFilter(UnaryOperator<String> test, IncludeExclude.StringFilter strings) {
+        /** Every key kept: no test at all. */
+        static final KeyFilter ALL = new KeyFilter(null, null);
+    }
+
+    /**
+     * What {@code body}'s include and exclude make of a key of {@code type},
+     * for aggregation {@code agg} ({@link KeyFilter}). {@code body} is the
+     * terms aggregation's own JSON body.
+     */
+    static KeyFilter keyTest(String agg, Map<String, Object> body, KeyType type) {
         Object include = body.get("include");
         Object exclude = body.get("exclude");
         if (include instanceof Map<?, ?>) {
@@ -100,34 +131,122 @@ final class InfinoIncludeExclude {
                 // Stock's own exception, so its status (500) too.
                 throw new AggregationExecutionException(regexOnNonString(agg, type));
             }
-            String inc = include == null ? null : anchored((String) include);
-            String exc = exclude == null ? null : anchored((String) exclude);
-            return key -> {
-                List<String> ands = new ArrayList<>();
-                if (inc != null) {
-                    ands.add("regexp_like(" + key + ", " + literal(inc) + ")");
-                }
-                if (exc != null) {
-                    ands.add("NOT regexp_like(" + key + ", " + literal(exc) + ")");
-                }
-                return "(" + String.join(" AND ", ands) + ")";
-            };
+            return regexTest(agg, (String) include, (String) exclude);
+        }
+        List<?> in = (List<?>) include;
+        List<?> out = (List<?>) exclude;
+        // As stock: an empty list of numbers, booleans or dates is no list at
+        // all (its long filter keeps every value), while an empty include of
+        // strings or addresses keeps no term. An empty exclude drops none.
+        if (in != null && in.isEmpty() && type != KeyType.KEYWORD && type != KeyType.IP) {
+            in = null;
+        }
+        if (out != null && out.isEmpty()) {
+            out = null;
+        }
+        if (in == null && out == null) {
+            return KeyFilter.ALL;
         }
         if (type == KeyType.DATE) {
             throw new Unsupported("aggregation [" + agg + "] has include/exclude values on a date field, which are not served");
         }
-        UnaryOperator<String> in = include == null ? null : valueTest(agg, (List<?>) include, type);
-        UnaryOperator<String> out = exclude == null ? null : valueTest(agg, (List<?>) exclude, type);
-        return key -> {
+        UnaryOperator<String> inTest = in == null ? null : valueTest(agg, in, type);
+        UnaryOperator<String> outTest = out == null ? null : valueTest(agg, out, type);
+        IncludeExclude.StringFilter strings = type == KeyType.KEYWORD
+            ? new IncludeExclude(texts(in), texts(out)).convertToStringFilter(DocValueFormat.RAW)
+            : null;
+        return new KeyFilter(key -> {
             List<String> ands = new ArrayList<>();
-            if (in != null) {
-                ands.add(in.apply(key));
+            if (inTest != null) {
+                ands.add(inTest.apply(key));
             }
-            if (out != null) {
-                ands.add("NOT " + out.apply(key));
+            if (outTest != null) {
+                ands.add("NOT " + outTest.apply(key));
             }
             return "(" + String.join(" AND ", ands) + ")";
-        };
+        }, strings);
+    }
+
+    /** {@code values} as text, as stock reads an include or exclude value; null for none. */
+    private static String[] texts(List<?> values) {
+        if (values == null) {
+            return null;
+        }
+        String[] out = new String[values.size()];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = String.valueOf(values.get(i));
+        }
+        return out;
+    }
+
+    /**
+     * A regular expression include and exclude over a keyword key. Stock's
+     * automaton for them, built as stock builds it by this release's Lucene,
+     * decides: a pattern it refuses is refused with its own exception, an
+     * include that keeps every string is no test, and the translation is used
+     * only where its language is exactly that automaton's.
+     */
+    private static KeyFilter regexTest(String agg, String include, String exclude) {
+        Automaton stock;
+        try {
+            stock = stockAutomaton(include, exclude);
+        } catch (TooComplexToDeterminizeException e) {
+            throw new Unsupported("aggregation [" + agg + "] has an include/exclude too complex to read: " + e.getMessage());
+        }
+        if (Operations.isEmpty(Operations.minus(Automata.makeAnyString(), stock, DETERMINIZE_WORK_LIMIT))) {
+            // Dashboards' suggestion request for an empty box (".*"): every key is kept.
+            return KeyFilter.ALL;
+        }
+        Reading in = include == null ? null : read(include);
+        Reading out = exclude == null ? null : read(exclude);
+        Automaton ours = in == null ? Automata.makeAnyString() : in.automaton();
+        try {
+            if (out != null) {
+                ours = Operations.minus(ours, out.automaton(), DETERMINIZE_WORK_LIMIT);
+            }
+            if (sameLanguage(ours, stock) == false) {
+                throw new Unsupported(
+                    "aggregation ["
+                        + agg
+                        + "] has an include/exclude regular expression that this release's Lucene reads differently from the table's"
+                        + " regular expressions (such as ~ as a complement, or a range from an escaped character in a class), which is not served"
+                );
+            }
+        } catch (TooComplexToDeterminizeException e) {
+            throw new Unsupported("aggregation [" + agg + "] has an include/exclude too complex to read: " + e.getMessage());
+        }
+        String inc = in == null ? null : in.anchored();
+        String exc = out == null ? null : out.anchored();
+        IncludeExclude.StringFilter strings = new IncludeExclude(include, exclude).convertToStringFilter(DocValueFormat.RAW, 0);
+        return new KeyFilter(key -> {
+            List<String> ands = new ArrayList<>();
+            if (inc != null) {
+                ands.add("regexp_like(" + key + ", " + literal(inc) + ")");
+            }
+            if (exc != null) {
+                ands.add("NOT regexp_like(" + key + ", " + literal(exc) + ")");
+            }
+            return "(" + String.join(" AND ", ands) + ")";
+        }, strings);
+    }
+
+    /**
+     * Stock's automaton for an include and exclude pattern, as its
+     * {@code IncludeExclude} builds it: the include (every string when there
+     * is none) less the exclude, determinized.
+     */
+    static Automaton stockAutomaton(String include, String exclude) {
+        Automaton a = include == null ? Automata.makeAnyString() : new RegExp(include).toAutomaton();
+        if (exclude != null) {
+            a = Operations.minus(a, new RegExp(exclude).toAutomaton(), DETERMINIZE_WORK_LIMIT);
+        }
+        return a.isDeterministic() ? a : Operations.determinize(a, DETERMINIZE_WORK_LIMIT);
+    }
+
+    /** Whether two automata accept the same strings. */
+    static boolean sameLanguage(Automaton a, Automaton b) {
+        return Operations.isEmpty(Operations.minus(a, b, DETERMINIZE_WORK_LIMIT))
+            && Operations.isEmpty(Operations.minus(b, a, DETERMINIZE_WORK_LIMIT));
     }
 
     /** Stock's refusal of a regular expression on a field whose terms are not strings. */
@@ -288,46 +407,64 @@ final class InfinoIncludeExclude {
 
     // ---- a Lucene regular expression in the engine's dialect ----
 
-    /** A Lucene regular expression over a whole value, as the engine's pattern for the same strings, anchored at both ends. */
-    static String anchored(String lucene) {
-        if (lucene.length() > MAX_REGEX_LENGTH) {
-            // Stock's own refusal, at its default limit.
-            throw new IllegalArgumentException(
-                "The length of regex ["
-                    + lucene.length()
-                    + "] used in the request has exceeded the allowed maximum of ["
-                    + MAX_REGEX_LENGTH
-                    + "]. This maximum can be set by changing the [index.max_regex_length] index level setting."
-            );
+    /**
+     * A Lucene regular expression as the translation reads it: the engine's
+     * pattern for it, anchored at both ends, and the automaton of the strings
+     * that pattern matches, to compare with Lucene's own reading.
+     */
+    record Reading(String anchored, Automaton automaton) {}
+
+    /** {@code lucene} as the translation reads it ({@link Reading}); a construct with no counterpart is refused by name. */
+    static Reading read(String lucene) {
+        Node node;
+        try {
+            node = new LuceneRegex(lucene).translate();
+        } catch (Unsupported e) {
+            throw e;
+        } catch (IllegalArgumentException e) {
+            // Only reached for a pattern this release's Lucene reads (stock's own reading refuses the rest first).
+            throw new Unsupported("the regular expression [" + lucene + "] cannot be read as this release's Lucene reads it (" + e.getMessage() + "), which is not served");
         }
-        String translated = new LuceneRegex(lucene).translate();
         // Every character the translation writes is escaped, so a bare parenthesis is one of its groups.
         int depth = 0;
-        for (int i = 0; i < translated.length(); i++) {
-            char ch = translated.charAt(i);
+        for (int i = 0; i < node.re().length(); i++) {
+            char ch = node.re().charAt(i);
             depth += ch == '(' ? 1 : 0;
             if (depth > MAX_GROUP_DEPTH) {
                 throw new Unsupported("the regular expression [" + lucene + "] nests groups and repetitions more than " + MAX_GROUP_DEPTH + " deep, which is not served");
             }
             depth -= ch == ')' ? 1 : 0;
         }
-        return "^(?:" + translated + ")$";
+        return new Reading("^(?:" + node.re() + ")$", node.automaton());
+    }
+
+    /** A Lucene regular expression over a whole value, as the engine's pattern for the same strings, anchored at both ends. */
+    static String anchored(String lucene) {
+        return read(lucene).anchored();
     }
 
     /**
+     * One construct of a pattern: the engine's pattern for it ({@code re}), the
+     * automaton of what that matches, and {@code size}, how many characters,
+     * classes and wildcards it stands for once its repetitions are written out.
+     */
+    private record Node(String re, Automaton automaton, long size) {}
+
+    /**
      * A recursive-descent reading of Lucene's {@code RegExp} syntax with its
-     * default flags (as {@code IncludeExclude} builds it), mirroring Lucene's
-     * parser step for step, so a pattern reads as Lucene reads it, quirks
-     * included: an operator character where no operator can stand is that
-     * character ({@code *a} is the text {@code *a}), {@code ^} and {@code $}
-     * are plain characters, and {@code \} before a character other than a
-     * letter or backslash is that character. It writes the same language in
-     * the engine's syntax: every character as a code-point escape, every
-     * group non-capturing, {@code .} matching any character, newlines
-     * included, as Lucene's does. Intersection ({@code &}), the empty
-     * language ({@code #}) and named automata or numeric intervals
-     * ({@code <...>}) have no counterpart there and are refused; a malformed
-     * pattern is refused with Lucene's own message.
+     * default flags (as {@code IncludeExclude} builds it), mirroring the newer
+     * Lucene parser step for step, quirks included: an operator character
+     * where no operator can stand is that character ({@code *a} is the text
+     * {@code *a}), {@code ^} and {@code $} are plain characters, and {@code \}
+     * before a character other than a letter or backslash is that character.
+     * It writes the same language in the engine's syntax: every character as
+     * a code-point escape, every group non-capturing, {@code .} matching any
+     * character, newlines included, as Lucene's does. Intersection
+     * ({@code &}), the empty language ({@code #}) and named automata or
+     * numeric intervals ({@code <...>}) have no counterpart there and are
+     * refused. Where a release's Lucene reads a pattern otherwise (an older
+     * one reads {@code ~} as a complement), the automaton this builds differs
+     * from Lucene's and {@link #regexTest} refuses the pattern.
      */
     static final class LuceneRegex {
         private final String s;
@@ -337,51 +474,74 @@ final class InfinoIncludeExclude {
             this.s = s;
         }
 
-        String translate() {
+        Node translate() {
             if (s.isEmpty()) {
-                return "";
+                return new Node("", Automata.makeEmptyString(), 0);
             }
-            String e = union();
+            Node e = union();
             if (pos < s.length()) {
                 throw new IllegalArgumentException("end-of-string expected at position " + pos);
             }
             return e;
         }
 
-        private String union() {
-            List<String> alts = new ArrayList<>();
+        private Node union() {
+            List<Node> alts = new ArrayList<>();
             alts.add(inter());
             while (match('|')) {
                 alts.add(inter());
             }
-            return alts.size() == 1 ? alts.get(0) : "(?:" + String.join("|", alts) + ")";
+            if (alts.size() == 1) {
+                return alts.get(0);
+            }
+            List<String> res = new ArrayList<>();
+            List<Automaton> automata = new ArrayList<>();
+            long size = 0;
+            for (Node alt : alts) {
+                res.add(alt.re());
+                automata.add(alt.automaton());
+                size += alt.size();
+            }
+            return node("(?:" + String.join("|", res) + ")", Operations.union(automata), size);
         }
 
-        private String inter() {
-            String e = concat();
+        private Node inter() {
+            Node e = concat();
             if (match('&')) {
                 throw new Unsupported("the regular expression [" + s + "] has an intersection (&), which is not served");
             }
             return e;
         }
 
-        private String concat() {
-            StringBuilder out = new StringBuilder(repeat());
+        private Node concat() {
+            List<Node> parts = new ArrayList<>();
+            parts.add(repeat());
             while (more() && !peek(")|&")) {
-                out.append(repeat());
+                parts.add(repeat());
             }
-            return out.toString();
+            if (parts.size() == 1) {
+                return parts.get(0);
+            }
+            StringBuilder re = new StringBuilder();
+            List<Automaton> automata = new ArrayList<>();
+            long size = 0;
+            for (Node part : parts) {
+                re.append(part.re());
+                automata.add(part.automaton());
+                size += part.size();
+            }
+            return node(re.toString(), Operations.concatenate(automata), size);
         }
 
-        private String repeat() {
-            String e = charClassExp();
+        private Node repeat() {
+            Node e = charClassExp();
             while (peek("?*+{")) {
                 if (match('?')) {
-                    e = "(?:" + e + ")?";
+                    e = node("(?:" + e.re() + ")?", Operations.optional(e.automaton()), e.size());
                 } else if (match('*')) {
-                    e = "(?:" + e + ")*";
+                    e = node("(?:" + e.re() + ")*", Operations.repeat(e.automaton()), e.size());
                 } else if (match('+')) {
-                    e = "(?:" + e + ")+";
+                    e = node("(?:" + e.re() + ")+", Operations.repeat(e.automaton(), 1), e.size());
                 } else if (match('{')) {
                     int n = count();
                     int m;
@@ -396,7 +556,11 @@ final class InfinoIncludeExclude {
                     if (m != -1 && n > m) {
                         throw new IllegalArgumentException("invalid repetition range(out of order): " + n + ".." + m);
                     }
-                    e = "(?:" + e + "){" + n + (m == n ? "" : m == -1 ? "," : "," + m) + "}";
+                    // Checked before the automaton is built: the engine writes {n,} as n copies and a star, {n,m} as m copies.
+                    long size = e.size() * (m == -1 ? n + 1L : m);
+                    checkSize(size);
+                    Automaton a = m == -1 ? Operations.repeat(e.automaton(), n) : Operations.repeat(e.automaton(), n, m);
+                    e = node("(?:" + e.re() + "){" + n + (m == n ? "" : m == -1 ? "," : "," + m) + "}", a, size);
                 }
             }
             return e;
@@ -413,13 +577,31 @@ final class InfinoIncludeExclude {
             }
             String digits = s.substring(start, pos);
             // Compared as text first: a count past an int is past the limit too.
-            if (digits.length() > Integer.toString(MAX_REPEAT).length() || Integer.parseInt(digits) > MAX_REPEAT) {
-                throw new Unsupported("the regular expression [" + s + "] repeats more than " + MAX_REPEAT + " times, which is not served");
+            if (digits.length() > Long.toString(MAX_EXPANDED_SIZE).length() || Integer.parseInt(digits) > MAX_EXPANDED_SIZE) {
+                checkSize(MAX_EXPANDED_SIZE + 1);
             }
             return Integer.parseInt(digits);
         }
 
-        private String charClassExp() {
+        private void checkSize(long size) {
+            if (size > MAX_EXPANDED_SIZE) {
+                throw new Unsupported(
+                    "the regular expression ["
+                        + s
+                        + "] stands for more than "
+                        + MAX_EXPANDED_SIZE
+                        + " characters once its repetitions are written out, which is not served"
+                );
+            }
+        }
+
+        /** A construct, its size checked against {@link #MAX_EXPANDED_SIZE}. */
+        private Node node(String re, Automaton automaton, long size) {
+            checkSize(size);
+            return new Node(re, automaton, size);
+        }
+
+        private Node charClassExp() {
             if (!match('[')) {
                 return simple();
             }
@@ -493,35 +675,38 @@ final class InfinoIncludeExclude {
             }
         }
 
-        private String simple() {
+        private Node simple() {
             if (match('.')) {
-                return "(?s:.)";
+                return node("(?s:.)", Automata.makeAnyChar(), 1);
             }
             if (match('#')) {
                 throw new Unsupported("the regular expression [" + s + "] has the empty language (#), which is not served");
             }
             if (match('@')) {
-                return "(?s:.*)";
+                return node("(?s:.*)", Automata.makeAnyString(), 1);
             }
             if (match('"')) {
-                StringBuilder out = new StringBuilder();
+                StringBuilder re = new StringBuilder();
+                StringBuilder text = new StringBuilder();
                 while (more() && !peek("\"")) {
-                    out.append(escape(next()));
+                    int c = next();
+                    re.append(escape(c));
+                    text.appendCodePoint(c);
                 }
                 if (!match('"')) {
                     throw new IllegalArgumentException("expected '\"' at position " + pos);
                 }
-                return "(?:" + out + ")";
+                return node("(?:" + re + ")", Automata.makeString(text.toString()), text.codePointCount(0, text.length()));
             }
             if (match('(')) {
                 if (match(')')) {
-                    return "(?:)";
+                    return node("(?:)", Automata.makeEmptyString(), 0);
                 }
-                String e = union();
+                Node e = union();
                 if (!match(')')) {
                     throw new IllegalArgumentException("expected ')' at position " + pos);
                 }
-                return "(?:" + e + ")";
+                return node("(?:" + e.re() + ")", e.automaton(), e.size());
             }
             if (match('<')) {
                 throw new Unsupported("the regular expression [" + s + "] has a named automaton or numeric interval (<...>), which is not served");
@@ -533,7 +718,8 @@ final class InfinoIncludeExclude {
                 predefined(ranges);
                 return charClass(ranges, false);
             }
-            return escape(charExp());
+            int c = charExp();
+            return node(escape(c), Automata.makeChar(c), 1);
         }
 
         private int charExp() {
@@ -541,7 +727,7 @@ final class InfinoIncludeExclude {
             return next();
         }
 
-        private static String charClass(List<int[]> ranges, boolean negate) {
+        private Node charClass(List<int[]> ranges, boolean negate) {
             StringBuilder out = new StringBuilder("[");
             if (negate) {
                 out.append('^');
@@ -552,7 +738,31 @@ final class InfinoIncludeExclude {
                     out.append('-').append(escape(r[1]));
                 }
             }
-            return out.append(']').toString();
+            List<int[]> kept = negate ? complement(ranges) : ranges;
+            List<Automaton> automata = new ArrayList<>();
+            for (int[] r : kept) {
+                automata.add(Automata.makeCharRange(r[0], r[1]));
+            }
+            // A class compiles to a branch per range it keeps, so it counts as that many characters.
+            return node(out.append(']').toString(), automata.isEmpty() ? Automata.makeEmpty() : Operations.union(automata), Math.max(1, kept.size()));
+        }
+
+        /** The code points none of {@code ranges} holds, as ranges. */
+        private static List<int[]> complement(List<int[]> ranges) {
+            List<int[]> sorted = new ArrayList<>(ranges);
+            sorted.sort(Comparator.comparingInt(r -> r[0]));
+            List<int[]> out = new ArrayList<>();
+            int next = Character.MIN_CODE_POINT;
+            for (int[] r : sorted) {
+                if (r[0] > next) {
+                    out.add(new int[] { next, r[0] - 1 });
+                }
+                next = Math.max(next, r[1] + 1);
+            }
+            if (next <= MAX_CODE_POINT) {
+                out.add(new int[] { next, MAX_CODE_POINT });
+            }
+            return out;
         }
 
         /** One character as the engine's pattern writes it: a letter or digit as itself, anything else as a code-point escape. */

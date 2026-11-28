@@ -432,3 +432,661 @@
   - do:
       indices.delete:
         index: tie_luc,tie_px,tie_def
+
+---
+"Terms include and exclude on awkward values, several values, missing, a query and empty lists, in both modes":
+  - do:
+      indices.create:
+        index: tie2_luc
+        body: {"settings": {"index.infino.enabled": false, "number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"host": {"type": "keyword"}, "tags": {"type": "keyword"}, "n": {"type": "long"}, "flag": {"type": "boolean"}, "ts": {"type": "date"}}}}
+  - do:
+      indices.create:
+        index: tie2_px
+        body: {"settings": {"index.infino.enabled": true, "index.infino.mode": "proxy", "number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"host": {"type": "keyword"}, "tags": {"type": "keyword"}, "n": {"type": "long"}, "flag": {"type": "boolean"}, "ts": {"type": "date"}}}}
+  - do:
+      indices.create:
+        index: tie2_def
+        body: {"settings": {"index.infino.enabled": true, "index.infino.mode": "default", "number_of_shards": 1, "number_of_replicas": 0}, "mappings": {"properties": {"host": {"type": "keyword"}, "tags": {"type": "keyword"}, "n": {"type": "long"}, "flag": {"type": "boolean"}, "ts": {"type": "date"}}}}
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - {"index": {"_index": "tie2_luc", "_id": "1"}}
+          - {"host": "a.b", "tags": ["a.b", "t1"], "n": 1, "flag": true, "ts": "2026-01-01"}
+          - {"index": {"_index": "tie2_luc", "_id": "2"}}
+          - {"host": "axb", "tags": ["axb"], "n": 2, "flag": false, "ts": "2026-01-02"}
+          - {"index": {"_index": "tie2_luc", "_id": "3"}}
+          - {"host": "a-b", "tags": ["a-b", "t1"], "n": 3, "flag": true, "ts": "2026-01-03"}
+          - {"index": {"_index": "tie2_luc", "_id": "4"}}
+          - {"host": "a_b", "n": 1, "flag": false, "ts": "2026-01-04"}
+          - {"index": {"_index": "tie2_luc", "_id": "5"}}
+          - {"host": "a/b", "n": 2, "ts": "2026-01-05"}
+          - {"index": {"_index": "tie2_luc", "_id": "6"}}
+          - {"host": "a b", "n": 3, "ts": "2026-01-06"}
+          - {"index": {"_index": "tie2_luc", "_id": "7"}}
+          - {"host": "a\"q", "n": 1, "ts": "2026-01-07"}
+          - {"index": {"_index": "tie2_luc", "_id": "8"}}
+          - {"host": "ä-umlaut", "n": 2, "ts": "2026-01-08"}
+          - {"index": {"_index": "tie2_luc", "_id": "9"}}
+          - {"host": "api", "tags": ["api", "t2"], "n": 3, "ts": "2026-01-09"}
+          - {"index": {"_index": "tie2_luc", "_id": "10"}}
+          - {"tags": ["t2"], "n": 1, "ts": "2026-01-02"}
+          - {"index": {"_index": "tie2_luc", "_id": "11"}}
+          - {"host": "api", "n": 2, "flag": true, "ts": "2026-01-03"}
+          - {"index": {"_index": "tie2_px", "_id": "1"}}
+          - {"host": "a.b", "tags": ["a.b", "t1"], "n": 1, "flag": true, "ts": "2026-01-01"}
+          - {"index": {"_index": "tie2_px", "_id": "2"}}
+          - {"host": "axb", "tags": ["axb"], "n": 2, "flag": false, "ts": "2026-01-02"}
+          - {"index": {"_index": "tie2_px", "_id": "3"}}
+          - {"host": "a-b", "tags": ["a-b", "t1"], "n": 3, "flag": true, "ts": "2026-01-03"}
+          - {"index": {"_index": "tie2_px", "_id": "4"}}
+          - {"host": "a_b", "n": 1, "flag": false, "ts": "2026-01-04"}
+          - {"index": {"_index": "tie2_px", "_id": "5"}}
+          - {"host": "a/b", "n": 2, "ts": "2026-01-05"}
+          - {"index": {"_index": "tie2_px", "_id": "6"}}
+          - {"host": "a b", "n": 3, "ts": "2026-01-06"}
+          - {"index": {"_index": "tie2_px", "_id": "7"}}
+          - {"host": "a\"q", "n": 1, "ts": "2026-01-07"}
+          - {"index": {"_index": "tie2_px", "_id": "8"}}
+          - {"host": "ä-umlaut", "n": 2, "ts": "2026-01-08"}
+          - {"index": {"_index": "tie2_px", "_id": "9"}}
+          - {"host": "api", "tags": ["api", "t2"], "n": 3, "ts": "2026-01-09"}
+          - {"index": {"_index": "tie2_px", "_id": "10"}}
+          - {"tags": ["t2"], "n": 1, "ts": "2026-01-02"}
+          - {"index": {"_index": "tie2_px", "_id": "11"}}
+          - {"host": "api", "n": 2, "flag": true, "ts": "2026-01-03"}
+          - {"index": {"_index": "tie2_def", "_id": "1"}}
+          - {"host": "a.b", "tags": ["a.b", "t1"], "n": 1, "flag": true, "ts": "2026-01-01"}
+          - {"index": {"_index": "tie2_def", "_id": "2"}}
+          - {"host": "axb", "tags": ["axb"], "n": 2, "flag": false, "ts": "2026-01-02"}
+          - {"index": {"_index": "tie2_def", "_id": "3"}}
+          - {"host": "a-b", "tags": ["a-b", "t1"], "n": 3, "flag": true, "ts": "2026-01-03"}
+          - {"index": {"_index": "tie2_def", "_id": "4"}}
+          - {"host": "a_b", "n": 1, "flag": false, "ts": "2026-01-04"}
+          - {"index": {"_index": "tie2_def", "_id": "5"}}
+          - {"host": "a/b", "n": 2, "ts": "2026-01-05"}
+          - {"index": {"_index": "tie2_def", "_id": "6"}}
+          - {"host": "a b", "n": 3, "ts": "2026-01-06"}
+          - {"index": {"_index": "tie2_def", "_id": "7"}}
+          - {"host": "a\"q", "n": 1, "ts": "2026-01-07"}
+          - {"index": {"_index": "tie2_def", "_id": "8"}}
+          - {"host": "ä-umlaut", "n": 2, "ts": "2026-01-08"}
+          - {"index": {"_index": "tie2_def", "_id": "9"}}
+          - {"host": "api", "tags": ["api", "t2"], "n": 3, "ts": "2026-01-09"}
+          - {"index": {"_index": "tie2_def", "_id": "10"}}
+          - {"tags": ["t2"], "n": 1, "ts": "2026-01-02"}
+          - {"index": {"_index": "tie2_def", "_id": "11"}}
+          - {"host": "api", "n": 2, "flag": true, "ts": "2026-01-03"}
+
+  # Typing a.b in the filter bar sends the dot escaped.
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "a\\.b.*"}}}}
+  - length: { aggregations.a.buckets: 1 }
+  - match: { aggregations.a.buckets.0.key: "a.b" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "a\\.b.*"}}}}
+  - length: { aggregations.a.buckets: 1 }
+  - match: { aggregations.a.buckets.0.key: "a.b" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "a\\.b.*"}}}}
+  - length: { aggregations.a.buckets: 1 }
+  - match: { aggregations.a.buckets.0.key: "a.b" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+
+  # Values with -, _, /, a space and a quote.
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "a(-|_|/| |\\\").*"}}}}
+  - length: { aggregations.a.buckets: 5 }
+  - match: { aggregations.a.buckets.0.key: "a b" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.buckets.1.key: "a\"q" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.buckets.2.key: "a-b" }
+  - match: { aggregations.a.buckets.2.doc_count: 1 }
+  - match: { aggregations.a.buckets.3.key: "a/b" }
+  - match: { aggregations.a.buckets.3.doc_count: 1 }
+  - match: { aggregations.a.buckets.4.key: "a_b" }
+  - match: { aggregations.a.buckets.4.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "a(-|_|/| |\\\").*"}}}}
+  - length: { aggregations.a.buckets: 5 }
+  - match: { aggregations.a.buckets.0.key: "a b" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.buckets.1.key: "a\"q" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.buckets.2.key: "a-b" }
+  - match: { aggregations.a.buckets.2.doc_count: 1 }
+  - match: { aggregations.a.buckets.3.key: "a/b" }
+  - match: { aggregations.a.buckets.3.doc_count: 1 }
+  - match: { aggregations.a.buckets.4.key: "a_b" }
+  - match: { aggregations.a.buckets.4.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "a(-|_|/| |\\\").*"}}}}
+  - length: { aggregations.a.buckets: 5 }
+  - match: { aggregations.a.buckets.0.key: "a b" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.buckets.1.key: "a\"q" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.buckets.2.key: "a-b" }
+  - match: { aggregations.a.buckets.2.doc_count: 1 }
+  - match: { aggregations.a.buckets.3.key: "a/b" }
+  - match: { aggregations.a.buckets.3.doc_count: 1 }
+  - match: { aggregations.a.buckets.4.key: "a_b" }
+  - match: { aggregations.a.buckets.4.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+
+  # A value that is not ASCII.
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "ä.*"}}}}
+  - length: { aggregations.a.buckets: 1 }
+  - match: { aggregations.a.buckets.0.key: "ä-umlaut" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "ä.*"}}}}
+  - length: { aggregations.a.buckets: 1 }
+  - match: { aggregations.a.buckets.0.key: "ä-umlaut" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "ä.*"}}}}
+  - length: { aggregations.a.buckets: 1 }
+  - match: { aggregations.a.buckets.0.key: "ä-umlaut" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+
+  # A pattern on a field documents give several values.
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "tags", "include": "a.*"}}}}
+  - length: { aggregations.a.buckets: 4 }
+  - match: { aggregations.a.buckets.0.key: "a-b" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.buckets.1.key: "a.b" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.buckets.2.key: "api" }
+  - match: { aggregations.a.buckets.2.doc_count: 1 }
+  - match: { aggregations.a.buckets.3.key: "axb" }
+  - match: { aggregations.a.buckets.3.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "tags", "include": "a.*"}}}}
+  - length: { aggregations.a.buckets: 4 }
+  - match: { aggregations.a.buckets.0.key: "a-b" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.buckets.1.key: "a.b" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.buckets.2.key: "api" }
+  - match: { aggregations.a.buckets.2.doc_count: 1 }
+  - match: { aggregations.a.buckets.3.key: "axb" }
+  - match: { aggregations.a.buckets.3.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "tags", "include": "a.*"}}}}
+  - length: { aggregations.a.buckets: 4 }
+  - match: { aggregations.a.buckets.0.key: "a-b" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.buckets.1.key: "a.b" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.buckets.2.key: "api" }
+  - match: { aggregations.a.buckets.2.doc_count: 1 }
+  - match: { aggregations.a.buckets.3.key: "axb" }
+  - match: { aggregations.a.buckets.3.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+
+  # An exclude on a field documents give several values.
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "tags", "exclude": "t.*"}}}}
+  - length: { aggregations.a.buckets: 4 }
+  - match: { aggregations.a.buckets.0.key: "a-b" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.buckets.1.key: "a.b" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.buckets.2.key: "api" }
+  - match: { aggregations.a.buckets.2.doc_count: 1 }
+  - match: { aggregations.a.buckets.3.key: "axb" }
+  - match: { aggregations.a.buckets.3.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "tags", "exclude": "t.*"}}}}
+  - length: { aggregations.a.buckets: 4 }
+  - match: { aggregations.a.buckets.0.key: "a-b" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.buckets.1.key: "a.b" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.buckets.2.key: "api" }
+  - match: { aggregations.a.buckets.2.doc_count: 1 }
+  - match: { aggregations.a.buckets.3.key: "axb" }
+  - match: { aggregations.a.buckets.3.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "tags", "exclude": "t.*"}}}}
+  - length: { aggregations.a.buckets: 4 }
+  - match: { aggregations.a.buckets.0.key: "a-b" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.buckets.1.key: "a.b" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.buckets.2.key: "api" }
+  - match: { aggregations.a.buckets.2.doc_count: 1 }
+  - match: { aggregations.a.buckets.3.key: "axb" }
+  - match: { aggregations.a.buckets.3.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+
+  # The missing value is a term the include tests too.
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "ap.*", "missing": "apnone"}}}}
+  - length: { aggregations.a.buckets: 2 }
+  - match: { aggregations.a.buckets.0.key: "api" }
+  - match: { aggregations.a.buckets.0.doc_count: 2 }
+  - match: { aggregations.a.buckets.1.key: "apnone" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "ap.*", "missing": "apnone"}}}}
+  - length: { aggregations.a.buckets: 2 }
+  - match: { aggregations.a.buckets.0.key: "api" }
+  - match: { aggregations.a.buckets.0.doc_count: 2 }
+  - match: { aggregations.a.buckets.1.key: "apnone" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "ap.*", "missing": "apnone"}}}}
+  - length: { aggregations.a.buckets: 2 }
+  - match: { aggregations.a.buckets.0.key: "api" }
+  - match: { aggregations.a.buckets.0.doc_count: 2 }
+  - match: { aggregations.a.buckets.1.key: "apnone" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+
+  # A missing value the include drops takes no bucket.
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "ap.*", "missing": "zz"}}}}
+  - length: { aggregations.a.buckets: 1 }
+  - match: { aggregations.a.buckets.0.key: "api" }
+  - match: { aggregations.a.buckets.0.doc_count: 2 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "ap.*", "missing": "zz"}}}}
+  - length: { aggregations.a.buckets: 1 }
+  - match: { aggregations.a.buckets.0.key: "api" }
+  - match: { aggregations.a.buckets.0.doc_count: 2 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "ap.*", "missing": "zz"}}}}
+  - length: { aggregations.a.buckets: 1 }
+  - match: { aggregations.a.buckets.0.key: "api" }
+  - match: { aggregations.a.buckets.0.doc_count: 2 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+
+  # Under a query filter.
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "a.*", "exclude": "ap.*"}}}, "query": {"range": {"ts": {"gte": "2026-01-03"}}}}
+  - length: { aggregations.a.buckets: 5 }
+  - match: { aggregations.a.buckets.0.key: "a b" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.buckets.1.key: "a\"q" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.buckets.2.key: "a-b" }
+  - match: { aggregations.a.buckets.2.doc_count: 1 }
+  - match: { aggregations.a.buckets.3.key: "a/b" }
+  - match: { aggregations.a.buckets.3.doc_count: 1 }
+  - match: { aggregations.a.buckets.4.key: "a_b" }
+  - match: { aggregations.a.buckets.4.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "a.*", "exclude": "ap.*"}}}, "query": {"range": {"ts": {"gte": "2026-01-03"}}}}
+  - length: { aggregations.a.buckets: 5 }
+  - match: { aggregations.a.buckets.0.key: "a b" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.buckets.1.key: "a\"q" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.buckets.2.key: "a-b" }
+  - match: { aggregations.a.buckets.2.doc_count: 1 }
+  - match: { aggregations.a.buckets.3.key: "a/b" }
+  - match: { aggregations.a.buckets.3.doc_count: 1 }
+  - match: { aggregations.a.buckets.4.key: "a_b" }
+  - match: { aggregations.a.buckets.4.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": "a.*", "exclude": "ap.*"}}}, "query": {"range": {"ts": {"gte": "2026-01-03"}}}}
+  - length: { aggregations.a.buckets: 5 }
+  - match: { aggregations.a.buckets.0.key: "a b" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.buckets.1.key: "a\"q" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.buckets.2.key: "a-b" }
+  - match: { aggregations.a.buckets.2.doc_count: 1 }
+  - match: { aggregations.a.buckets.3.key: "a/b" }
+  - match: { aggregations.a.buckets.3.doc_count: 1 }
+  - match: { aggregations.a.buckets.4.key: "a_b" }
+  - match: { aggregations.a.buckets.4.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+
+  # Under a query filter, the empty box's .* keeps every key.
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 3, "field": "host", "include": ".*"}}}, "query": {"range": {"ts": {"gte": "2026-01-03"}}}}
+  - length: { aggregations.a.buckets: 3 }
+  - match: { aggregations.a.buckets.0.key: "api" }
+  - match: { aggregations.a.buckets.0.doc_count: 2 }
+  - match: { aggregations.a.buckets.1.key: "a b" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.buckets.2.key: "a\"q" }
+  - match: { aggregations.a.buckets.2.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 4 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 3, "field": "host", "include": ".*"}}}, "query": {"range": {"ts": {"gte": "2026-01-03"}}}}
+  - length: { aggregations.a.buckets: 3 }
+  - match: { aggregations.a.buckets.0.key: "api" }
+  - match: { aggregations.a.buckets.0.doc_count: 2 }
+  - match: { aggregations.a.buckets.1.key: "a b" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.buckets.2.key: "a\"q" }
+  - match: { aggregations.a.buckets.2.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 4 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 3, "field": "host", "include": ".*"}}}, "query": {"range": {"ts": {"gte": "2026-01-03"}}}}
+  - length: { aggregations.a.buckets: 3 }
+  - match: { aggregations.a.buckets.0.key: "api" }
+  - match: { aggregations.a.buckets.0.doc_count: 2 }
+  - match: { aggregations.a.buckets.1.key: "a b" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.buckets.2.key: "a\"q" }
+  - match: { aggregations.a.buckets.2.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 4 }
+
+  # Over the whole table, cut to size, the kept keys left out counted as other.
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 2, "field": "host", "include": "a.*"}}}}
+  - length: { aggregations.a.buckets: 2 }
+  - match: { aggregations.a.buckets.0.key: "api" }
+  - match: { aggregations.a.buckets.0.doc_count: 2 }
+  - match: { aggregations.a.buckets.1.key: "a b" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 6 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 2, "field": "host", "include": "a.*"}}}}
+  - length: { aggregations.a.buckets: 2 }
+  - match: { aggregations.a.buckets.0.key: "api" }
+  - match: { aggregations.a.buckets.0.doc_count: 2 }
+  - match: { aggregations.a.buckets.1.key: "a b" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 6 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 2, "field": "host", "include": "a.*"}}}}
+  - length: { aggregations.a.buckets: 2 }
+  - match: { aggregations.a.buckets.0.key: "api" }
+  - match: { aggregations.a.buckets.0.doc_count: 2 }
+  - match: { aggregations.a.buckets.1.key: "a b" }
+  - match: { aggregations.a.buckets.1.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 6 }
+
+  # An exclude over the whole table.
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "exclude": "a.*"}}}}
+  - length: { aggregations.a.buckets: 1 }
+  - match: { aggregations.a.buckets.0.key: "ä-umlaut" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "exclude": "a.*"}}}}
+  - length: { aggregations.a.buckets: 1 }
+  - match: { aggregations.a.buckets.0.key: "ä-umlaut" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "exclude": "a.*"}}}}
+  - length: { aggregations.a.buckets: 1 }
+  - match: { aggregations.a.buckets.0.key: "ä-umlaut" }
+  - match: { aggregations.a.buckets.0.doc_count: 1 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+
+  # An empty include on a number field keeps every value, as stock's long filter does.
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "n", "include": []}}}}
+  - length: { aggregations.a.buckets: 3 }
+  - match: { aggregations.a.buckets.0.key: 1 }
+  - match: { aggregations.a.buckets.0.doc_count: 4 }
+  - match: { aggregations.a.buckets.1.key: 2 }
+  - match: { aggregations.a.buckets.1.doc_count: 4 }
+  - match: { aggregations.a.buckets.2.key: 3 }
+  - match: { aggregations.a.buckets.2.doc_count: 3 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "n", "include": []}}}}
+  - length: { aggregations.a.buckets: 3 }
+  - match: { aggregations.a.buckets.0.key: 1 }
+  - match: { aggregations.a.buckets.0.doc_count: 4 }
+  - match: { aggregations.a.buckets.1.key: 2 }
+  - match: { aggregations.a.buckets.1.doc_count: 4 }
+  - match: { aggregations.a.buckets.2.key: 3 }
+  - match: { aggregations.a.buckets.2.doc_count: 3 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "n", "include": []}}}}
+  - length: { aggregations.a.buckets: 3 }
+  - match: { aggregations.a.buckets.0.key: 1 }
+  - match: { aggregations.a.buckets.0.doc_count: 4 }
+  - match: { aggregations.a.buckets.1.key: 2 }
+  - match: { aggregations.a.buckets.1.doc_count: 4 }
+  - match: { aggregations.a.buckets.2.key: 3 }
+  - match: { aggregations.a.buckets.2.doc_count: 3 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+
+  # An empty include on a boolean field keeps every value too.
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "flag", "include": []}}}}
+  - length: { aggregations.a.buckets: 2 }
+  - match: { aggregations.a.buckets.0.key: 1 }
+  - match: { aggregations.a.buckets.0.doc_count: 3 }
+  - match: { aggregations.a.buckets.1.key: 0 }
+  - match: { aggregations.a.buckets.1.doc_count: 2 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "flag", "include": []}}}}
+  - length: { aggregations.a.buckets: 2 }
+  - match: { aggregations.a.buckets.0.key: 1 }
+  - match: { aggregations.a.buckets.0.doc_count: 3 }
+  - match: { aggregations.a.buckets.1.key: 0 }
+  - match: { aggregations.a.buckets.1.doc_count: 2 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "flag", "include": []}}}}
+  - length: { aggregations.a.buckets: 2 }
+  - match: { aggregations.a.buckets.0.key: 1 }
+  - match: { aggregations.a.buckets.0.doc_count: 3 }
+  - match: { aggregations.a.buckets.1.key: 0 }
+  - match: { aggregations.a.buckets.1.doc_count: 2 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+
+  # An empty include on a keyword field keeps no term.
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": []}}}}
+  - length: { aggregations.a.buckets: 0 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": []}}}}
+  - length: { aggregations.a.buckets: 0 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "host", "include": []}}}}
+  - length: { aggregations.a.buckets: 0 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+
+  # An empty exclude drops nothing.
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "n", "exclude": []}}}}
+  - length: { aggregations.a.buckets: 3 }
+  - match: { aggregations.a.buckets.0.key: 1 }
+  - match: { aggregations.a.buckets.0.doc_count: 4 }
+  - match: { aggregations.a.buckets.1.key: 2 }
+  - match: { aggregations.a.buckets.1.doc_count: 4 }
+  - match: { aggregations.a.buckets.2.key: 3 }
+  - match: { aggregations.a.buckets.2.doc_count: 3 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "n", "exclude": []}}}}
+  - length: { aggregations.a.buckets: 3 }
+  - match: { aggregations.a.buckets.0.key: 1 }
+  - match: { aggregations.a.buckets.0.doc_count: 4 }
+  - match: { aggregations.a.buckets.1.key: 2 }
+  - match: { aggregations.a.buckets.1.doc_count: 4 }
+  - match: { aggregations.a.buckets.2.key: 3 }
+  - match: { aggregations.a.buckets.2.doc_count: 3 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"size": 20, "field": "n", "exclude": []}}}}
+  - length: { aggregations.a.buckets: 3 }
+  - match: { aggregations.a.buckets.0.key: 1 }
+  - match: { aggregations.a.buckets.0.doc_count: 4 }
+  - match: { aggregations.a.buckets.1.key: 2 }
+  - match: { aggregations.a.buckets.1.doc_count: 4 }
+  - match: { aggregations.a.buckets.2.key: 3 }
+  - match: { aggregations.a.buckets.2.doc_count: 3 }
+  - match: { aggregations.a.sum_other_doc_count: 0 }
+
+  # Repetitions that, written out, are a million characters: refused by name rather than failing in the engine.
+  - do:
+      catch: /once its repetitions are written out/
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"field": "host", "include": "(a{1000}){1000}"}}}}
+  - do:
+      catch: /once its repetitions are written out/
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"field": "host", "include": "(a{1000}){1000}"}}}}
+
+  # The index's own index.max_regex_length bounds a pattern, as on stock.
+  - do:
+      indices.put_settings:
+        index: tie2_luc,tie2_px,tie2_def
+        body: { index.max_regex_length: 10 }
+  - do:
+      catch: /index.max_regex_length/
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"field": "host", "include": "abcdefghij.*"}}}}
+  - do:
+      catch: /index.max_regex_length/
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"field": "host", "include": "abcdefghij.*"}}}}
+  - do:
+      catch: /index.max_regex_length/
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"field": "host", "include": "abcdefghij.*"}}}}
+  - do:
+      search:
+        index: tie2_luc
+        body: {"size": 0, "aggs": {"a": {"terms": {"field": "host", "include": "a\\.b.*"}}}}
+  - length: { aggregations.a.buckets: 1 }
+  - do:
+      search:
+        index: tie2_px
+        body: {"size": 0, "aggs": {"a": {"terms": {"field": "host", "include": "a\\.b.*"}}}}
+  - length: { aggregations.a.buckets: 1 }
+  - do:
+      search:
+        index: tie2_def
+        body: {"size": 0, "aggs": {"a": {"terms": {"field": "host", "include": "a\\.b.*"}}}}
+  - length: { aggregations.a.buckets: 1 }
+  - do:
+      indices.delete:
+        index: tie2_luc,tie2_px,tie2_def

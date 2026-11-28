@@ -24,12 +24,14 @@ import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.index.query.WildcardQueryBuilder;
 import org.opensearch.index.query.functionscore.FunctionScoreQueryBuilder;
 import org.opensearch.index.query.functionscore.ScriptScoreQueryBuilder;
+import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.bucket.filter.FilterAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.filter.FiltersAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.filter.FiltersAggregator;
 import org.opensearch.search.aggregations.bucket.terms.SignificantTermsAggregationBuilder;
+import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.fetch.subphase.highlight.HighlightBuilder;
 import org.opensearch.search.rescore.QueryRescorerBuilder;
@@ -71,6 +73,9 @@ final class InfinoSearchChecks {
             }
             checkRescores(source, settings);
             checkFields(source, settings);
+            if (source.aggregations() != null) {
+                checkIncludeExclude(source.aggregations().getAggregatorFactories(), settings, properties);
+            }
             checkTokenCountDocValues(source, properties);
             if (source.storedFields() != null) {
                 checkNoStoredFields(source);
@@ -126,6 +131,44 @@ final class InfinoSearchChecks {
         }
         all.removeIf(Objects::isNull);
         return all;
+    }
+
+    /** The mapped types whose terms are not strings: stock refuses a regular expression include on them with an error of its own. */
+    private static final Set<String> NON_STRING_TYPES = Set.of(
+        "long",
+        "integer",
+        "short",
+        "byte",
+        "double",
+        "float",
+        "half_float",
+        "scaled_float",
+        "unsigned_long",
+        "boolean",
+        "ip",
+        "date",
+        "date_nanos"
+    );
+
+    /**
+     * Read every terms aggregation's regular expression include/exclude over a
+     * string field as each shard of stock reads it, under the index's
+     * {@code index.max_regex_length}: a pattern past it, one this release's
+     * Lucene cannot parse, or one too complex to determinize fails with
+     * stock's own exception.
+     */
+    private static void checkIncludeExclude(Collection<AggregationBuilder> aggregations, Settings settings, Map<String, Object> properties) {
+        for (AggregationBuilder agg : aggregations) {
+            if (agg instanceof TermsAggregationBuilder terms
+                && terms.includeExclude() != null
+                && terms.includeExclude().isRegexBased()
+                && terms.script() == null
+                && field(properties, terms.field()) instanceof Map<String, Object> mapped
+                && NON_STRING_TYPES.contains(String.valueOf(mapped.get("type"))) == false) {
+                terms.includeExclude().convertToStringFilter(DocValueFormat.RAW, IndexSettings.MAX_REGEX_LENGTH_SETTING.get(settings));
+            }
+            checkIncludeExclude(agg.getSubAggregations(), settings, properties);
+        }
     }
 
     private static void aggregationQueries(Collection<AggregationBuilder> aggregations, List<QueryBuilder> all) {

@@ -67,6 +67,7 @@ import org.opensearch.search.aggregations.bucket.range.InternalDateRange;
 import org.opensearch.search.aggregations.bucket.range.InternalRange;
 import org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.range.RangeAggregator;
+import org.opensearch.search.aggregations.bucket.terms.IncludeExclude;
 import org.opensearch.search.aggregations.bucket.terms.LongTerms;
 import org.opensearch.search.aggregations.bucket.terms.SignificantStringTerms;
 import org.opensearch.search.aggregations.bucket.terms.SignificantTermsAggregationBuilder;
@@ -173,6 +174,14 @@ public class InfinoAggregationProcessor {
      * about fifteen hundred.
      */
     private static final int MAX_GROUPS_PICKED_HERE = 1_000;
+
+    /**
+     * The most distinct values of a keyword column read across to be kept by
+     * a terms level's include/exclude here ({@link #filteredValueCounts});
+     * past it the level's statement tests the pattern instead.
+     */
+    private static final int MAX_VALUES_FILTERED_HERE = 100_000;
+
     /** The alias the request's total takes when it is read beside the root metrics. */
     private static final String TOTAL_ALIAS = "request_total";
     /** Parent buckets a nested grouped level is restricted to; past this the key list is not worth a predicate. */
@@ -1715,6 +1724,14 @@ public class InfinoAggregationProcessor {
      */
     record HistKey(double interval, double offset, boolean keyed, DocValueFormat format, double min, double max) {}
 
+    /**
+     * A terms level's include/exclude ({@code filter}, which keeps some keys
+     * only). {@code column} is the keyword column the key is when its values
+     * may be read and kept outside a statement: no document gives the field
+     * several values and no missing value stands in; null otherwise.
+     */
+    record Filtering(InfinoIncludeExclude.KeyFilter filter, String column) {}
+
     /** A grouped bucket level: terms, date_histogram or histogram. */
     static final class Grouped extends BucketSpec {
         final Source source;
@@ -1726,6 +1743,8 @@ public class InfinoAggregationProcessor {
         final String orderTemplate;
         final DateKey date;
         final HistKey hist;
+        /** A terms level's include/exclude; null for none, or for one that keeps every key. */
+        final Filtering filtering;
 
         private Grouped(
             AggregationBuilder b,
@@ -1739,7 +1758,8 @@ public class InfinoAggregationProcessor {
             long minDocCount,
             String orderTemplate,
             DateKey date,
-            HistKey hist
+            HistKey hist,
+            Filtering filtering
         ) {
             super(b, leaves, child);
             this.source = source;
@@ -1751,6 +1771,7 @@ public class InfinoAggregationProcessor {
             this.orderTemplate = orderTemplate;
             this.date = date;
             this.hist = hist;
+            this.filtering = filtering;
             // A level's top hits are a window over the documents partitioned by its key,
             // which a document with several values would stand in once per value.
             if (source.multi() && !leaves.hits().isEmpty()) {
@@ -1782,6 +1803,7 @@ public class InfinoAggregationProcessor {
                 throw masked(t, c); // a numeric or date key would be the value itself
             }
             String keyExpr = c.expr();
+            Filtering filtering = null;
             if (t.includeExclude() != null) {
                 // A key the include/exclude drops is no key: the level sees no
                 // value there, so it takes no bucket and counts as other to no
@@ -1792,13 +1814,18 @@ public class InfinoAggregationProcessor {
                 if (t.format() != null) {
                     throw new Unsupported("aggregation [" + t.getName() + "] has include/exclude with a format, which is not served");
                 }
-                UnaryOperator<String> keep = InfinoIncludeExclude.keyTest(t.getName(), bodyOf(t, TermsAggregationBuilder.NAME), keyType(t, cols, kind));
-                if (c.multi()) {
-                    // The key is read per value, under the field's own name (groupStatement).
-                    keyExpr = "CASE WHEN " + keep.apply(c.expr()) + " THEN " + c.expr() + " END";
-                } else {
-                    c = c.where(keep.apply(c.expr()));
-                    keyExpr = c.expr();
+                InfinoIncludeExclude.KeyFilter f = InfinoIncludeExclude.keyTest(t.getName(), bodyOf(t, TermsAggregationBuilder.NAME), keyType(t, cols, kind));
+                if (f.test() != null) {
+                    if (c.multi()) {
+                        // The key is read per value, under the field's own name (groupStatement).
+                        keyExpr = "CASE WHEN " + f.test().apply(c.expr()) + " THEN " + c.expr() + " END";
+                        filtering = new Filtering(f, null);
+                    } else {
+                        boolean bare = c.column() != null && c.expr().equals(quoteIdent(c.column()));
+                        filtering = new Filtering(f, bare && f.strings() != null ? c.column() : null);
+                        c = c.where(f.test().apply(c.expr()));
+                        keyExpr = c.expr();
+                    }
                 }
             }
             String order = orderClause(t.order(), leaves.metrics());
@@ -1806,7 +1833,7 @@ public class InfinoAggregationProcessor {
                 throw new Unsupported("aggregation [" + t.getName() + "] has an order the table cannot sort by: " + t.order());
             }
             long minDocCount = shardOfMany ? Math.min(t.shardMinDocCount(), t.minDocCount()) : t.minDocCount();
-            return new Grouped(t, leaves, child, c, keyExpr, kind, true, shardSize(t), minDocCount, order, null, null);
+            return new Grouped(t, leaves, child, c, keyExpr, kind, true, shardSize(t), minDocCount, order, null, null, filtering);
         }
 
         /** How a terms level's include/exclude values are read against its key of {@code kind}: an ip field's as addresses. */
@@ -1870,7 +1897,7 @@ public class InfinoAggregationProcessor {
                 bounds = new LongBounds(min == null ? null : prepared.round(min), max == null ? null : prepared.round(max));
             }
             DateKey date = new DateKey(format, expr.rounding(), bounds, dh.keyed(), dh.offset());
-            return new Grouped(dh, leaves, child, c, expr.keyExpr(), KeyKind.DATE, false, Integer.MAX_VALUE, dh.minDocCount(), "{key} ASC", date, null);
+            return new Grouped(dh, leaves, child, c, expr.keyExpr(), KeyKind.DATE, false, Integer.MAX_VALUE, dh.minDocCount(), "{key} ASC", date, null, null);
         }
 
         static Grouped histogram(HistogramAggregationBuilder h, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child, long now) {
@@ -1906,7 +1933,7 @@ public class InfinoAggregationProcessor {
                 : h.format() == null ? DocValueFormat.RAW
                 : new DocValueFormat.Decimal(h.format());
             HistKey hist = new HistKey(h.interval(), h.offset(), h.keyed(), format, h.minBound(), h.maxBound());
-            return new Grouped(h, leaves, child, c, keyExpr, KeyKind.DOUBLE, false, Integer.MAX_VALUE, h.minDocCount(), order, null, hist);
+            return new Grouped(h, leaves, child, c, keyExpr, KeyKind.DOUBLE, false, Integer.MAX_VALUE, h.minDocCount(), order, null, hist, null);
         }
 
         /**
@@ -4328,6 +4355,10 @@ public class InfinoAggregationProcessor {
         }
         List<Grouped> chain = List.of(level);
         String picked = levelInner(chain, 0, q.from(), q.where(), "", true);
+        Long filteredTotal = filteredValueCounts(level, q, picked);
+        if (filteredTotal != null) {
+            return filteredTotal;
+        }
         if (!readsValueCounts(level, q)) {
             Long fusedTotal = fusedTopTerms(level, q, picked);
             if (fusedTotal != null) {
@@ -4420,6 +4451,57 @@ public class InfinoAggregationProcessor {
         readAhead.put(picked, groups);
         fusedKeyedTotals.put(picked, keyed);
         fused.put(s, new Fused(q.from(), q.where(), rows));
+        return total;
+    }
+
+    /**
+     * The request's total and a filtered terms level's groups over the whole
+     * table, read from its column's value counts and kept by stock's own
+     * include/exclude filter here, rather than by a statement that tests the
+     * pattern on every row: the engine counts a keyword column's values from
+     * its term index, so only the column's distinct values cross. The groups
+     * kept are read ahead for the level to pick its buckets from
+     * ({@link #pickTopTerms}), with their rows as its keyed total, so
+     * {@code sum_other_doc_count} counts the kept groups left out, as the
+     * statement would; every row, kept or not, counts toward the total.
+     *
+     * <p>Only for a request that does not filter the table, over a level with
+     * no metrics whose key is a keyword column it may filter so
+     * ({@link Filtering#column}). Null otherwise, and when the column has
+     * more than {@link #MAX_VALUES_FILTERED_HERE} values, for the level's own
+     * statement to filter them.
+     */
+    private Long filteredValueCounts(Grouped level, Translation q, String picked) {
+        if (level.filtering == null
+            || level.filtering.column() == null
+            || q.principal() != null
+            || !InfinoQueryTranslator.ALL.equals(q.where())
+            || !level.metrics.isEmpty()) {
+            return null;
+        }
+        String column = level.filtering.column();
+        List<Map<String, Object>> counts = InfinoNative.valueCounts(q.table(), column, MAX_VALUES_FILTERED_HERE);
+        if (counts == null) {
+            return null;
+        }
+        IncludeExclude.StringFilter keep = level.filtering.filter().strings();
+        long total = 0;
+        long keyedTotal = 0;
+        List<Map<String, Object>> kept = new ArrayList<>();
+        for (Map<String, Object> row : counts) {
+            long count = asLong(row.get(InfinoNative.VALUE_COUNT));
+            total += count;
+            Object key = row.get(column);
+            if (key != null && keep.accept(new BytesRef(key.toString()))) {
+                Map<String, Object> group = new HashMap<>();
+                group.put("k0", key);
+                group.put("doc_count", count);
+                kept.add(group);
+                keyedTotal += count;
+            }
+        }
+        readAhead.put(picked, kept);
+        fusedKeyedTotals.put(picked, keyedTotal);
         return total;
     }
 
