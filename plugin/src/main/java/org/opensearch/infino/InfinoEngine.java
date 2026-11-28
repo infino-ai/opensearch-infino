@@ -15,6 +15,7 @@ import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.common.Randomness;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
@@ -28,7 +29,6 @@ import org.opensearch.index.engine.EngineCreationFailureException;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.FlushFailedEngineException;
 import org.opensearch.index.engine.InternalEngine;
-import org.opensearch.index.mapper.MapperParsingException;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.ParseContext.Document;
 import org.opensearch.index.mapper.SourceFieldMapper;
@@ -63,6 +63,7 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
+import java.util.function.LongUnaryOperator;
 import java.util.function.Predicate;
 
 /**
@@ -99,12 +100,12 @@ import java.util.function.Predicate;
  * in the table. A commit that fails keeps its batch for the next one and
  * fails what asked for it: the write's sync, or the flush, so the translog
  * keeps the writes the table lacks. A hosted service that could not be
- * reached or did not answer fails neither: the batch is kept for the next
- * commit, as a write the table did not take is, so the write is
- * acknowledged and the table's hold on the shard's history stays below it
- * (see {@link #commitBeforeSync} and {@link #holdHistoryThrough}). A batch
- * of deletes alone still fails the sync then, since the bridge answers a
- * delete with a code and not the reason; a delete retried does no harm.
+ * reached, did not answer, or turned the commit away for the account's
+ * request rate fails neither: the batch is kept for the next commit, as a
+ * write the table did not take is, so the write is acknowledged and the
+ * table's hold on the shard's history stays below it (see
+ * {@link #commitBeforeSync} and {@link #holdHistoryThrough}). After a
+ * rate limit, commits make no call until a backoff ends ({@link RateLimit}).
  * Writes wait rather than pile up past a bound while commits fail.
  *
  * <p>A search sees what the skeleton's reader sees, as on a stock index: a
@@ -227,6 +228,13 @@ public class InfinoEngine extends InternalEngine {
     /** The first and the longest pause between looks at what the copies hold while waiting for them. */
     private static final long COPIES_POLL_MIN_NANOS = TimeUnit.MICROSECONDS.toNanos(50);
     private static final long COPIES_POLL_MAX_NANOS = TimeUnit.MILLISECONDS.toNanos(5);
+    /**
+     * The first and the longest pause before a commit calls the hosted service
+     * again after it turned commits away for the account's request rate (see
+     * {@link RateLimit}): doubled for each commit turned away in a row.
+     */
+    static final long RATE_LIMIT_PAUSE_MIN_NANOS = TimeUnit.SECONDS.toNanos(1);
+    static final long RATE_LIMIT_PAUSE_MAX_NANOS = TimeUnit.SECONDS.toNanos(30);
     /** The changes-snapshot source of the history a new primary writes into the table. */
     private static final String FILL_SOURCE = "infino_fill";
     /** A sequence number below every operation's: what a primary that handed its shard off may commit through. */
@@ -460,10 +468,22 @@ public class InfinoEngine extends InternalEngine {
          * failed commit may have reached the table in part.
          */
         void putBack(Batch failed) {
+            putBack(failed, true);
+        }
+
+        /**
+         * Put back, ahead of the writes recorded since, the writes of a commit
+         * that did not take them: with {@code lookUp}, each id's row is looked
+         * up at the next commit; without, each keeps the base it carries,
+         * which the commit that returned it to retry set (see {@link #write}).
+         */
+        void putBack(Batch failed, boolean lookUp) {
             Map<String, Entry> merged = new LinkedHashMap<>();
             for (Map.Entry<String, Entry> me : failed.entries.entrySet()) {
                 Entry older = me.getValue();
-                older.base = Base.UNKNOWN;
+                if (lookUp) {
+                    older.base = Base.UNKNOWN;
+                }
                 Entry newer = entries.get(me.getKey());
                 if (newer != null) {
                     older.versions.addAll(newer.versions);
@@ -631,6 +651,53 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /**
+     * When a table's next commit may call the hosted service, after the
+     * service turned commits away for the account's request rate: each
+     * commit turned away in a row doubles the pause, from
+     * {@link #RATE_LIMIT_PAUSE_MIN_NANOS} up to
+     * {@link #RATE_LIMIT_PAUSE_MAX_NANOS}, and the pause taken is a random
+     * part of it, between half and all, so the shards a limit stopped
+     * together do not all call again at once. A commit the service takes
+     * clears it. Until the pause ends, a commit makes no call: the writes
+     * wait in the batch, which the translog and the table's hold on the
+     * shard's history keep, and new writes are refused once too many wait
+     * (see {@link #refuseWhileBacklogged}). The engine's hosted client does
+     * not pass the service's {@code Retry-After} on, so the pause is this
+     * backoff alone.
+     */
+    static final class RateLimit {
+        /** Given a pause, the part of it taken. */
+        private final LongUnaryOperator jitter;
+        /** The current pause; 0 when the last commit was not turned away. */
+        private long pause = 0;
+        /** When the pause ends ({@link System#nanoTime}). */
+        private long notBefore = 0;
+
+        RateLimit() {
+            this(pause -> pause / 2 + Randomness.get().nextLong(pause / 2 + 1));
+        }
+
+        RateLimit(LongUnaryOperator jitter) {
+            this.jitter = jitter;
+        }
+
+        /** Whether a commit at {@code now} waits, making no call. */
+        synchronized boolean waits(long now) {
+            return pause > 0 && now - notBefore < 0;
+        }
+
+        /** Record a commit made at {@code now}: whether the service turned it away for the rate. */
+        synchronized void after(boolean rateLimited, long now) {
+            if (!rateLimited) {
+                pause = 0;
+                return;
+            }
+            pause = pause == 0 ? RATE_LIMIT_PAUSE_MIN_NANOS : Math.min(RATE_LIMIT_PAUSE_MAX_NANOS, pause * 2);
+            notBefore = now + jitter.applyAsLong(pause);
+        }
+    }
+
+    /**
      * Which copy of a shard this node holds: whether it is the primary, its
      * allocation, and whether it is recovering as the target of the
      * primary's move to this node.
@@ -768,6 +835,8 @@ public class InfinoEngine extends InternalEngine {
     private final AtomicBoolean unrefreshedRefreshQueued = new AtomicBoolean();
     /** Whether the engine is closing: its final flush commits what the copies hold without waiting for more. */
     private volatile boolean closing = false;
+    /** When the next commit may call the hosted service, after a rate limit. */
+    private final RateLimit rateLimit = new RateLimit();
     /** Whether the shard's checkpoints could not be read, already logged. */
     private final AtomicBoolean untrackedLogged = new AtomicBoolean();
 
@@ -1525,7 +1594,7 @@ public class InfinoEngine extends InternalEngine {
                 return new IndexResult(e, index.version());
             }
             if (why != null) {
-                return new IndexResult(new MapperParsingException("[infino] " + why), index.version());
+                return new IndexResult(InfinoWriter.refusedAtWrite(why), index.version());
             }
         }
         // Lucene keeps the document's identity only: the metadata fields the
@@ -1764,7 +1833,9 @@ public class InfinoEngine extends InternalEngine {
      * order they were taken. The translog is synced first (see the class
      * comment). A failure keeps the writes for the next commit and is thrown;
      * false when the table took the commit but not every write of it, which
-     * waits for the next commit (see {@link #notTaken}).
+     * waits for the next commit (see {@link #notTaken}), or when the hosted
+     * service's rate limit holds commits back ({@link RateLimit}): then no
+     * call is made, and the writes wait, but at a close, which tries once.
      */
     private boolean commitBatch() {
         synchronized (commitLock) {
@@ -1775,6 +1846,9 @@ public class InfinoEngine extends InternalEngine {
                 if (batch.isEmpty()) {
                     return true;
                 }
+            }
+            if (!closing && rateLimit.waits(System.nanoTime())) {
+                return false;
             }
             try {
                 translogManager().syncTranslog();
@@ -1839,7 +1913,7 @@ public class InfinoEngine extends InternalEngine {
                     if (retry == null) {
                         batch.putBack(b);
                     } else if (!retry.isEmpty()) {
-                        batch.putBack(retry);
+                        batch.putBack(retry, false); // each write to retry carries its base (see write)
                     }
                 }
             }
@@ -2143,6 +2217,7 @@ public class InfinoEngine extends InternalEngine {
             () -> InfinoPlugin.tables().ensure(config().getIndexSettings().getIndexMetadata(), config().getShardId().id()),
             this::withMapped
         );
+        rateLimit.after(w.rateLimited(), System.nanoTime());
         InfinoNative.forgetSources(table, w.touched());
         if (!w.touched().isEmpty() && readsLatest) {
             // This node's connection has read the table at its own commit, the latest.
@@ -2155,11 +2230,12 @@ public class InfinoEngine extends InternalEngine {
 
     /**
      * What {@link #write} did: the writes to retry, the ids it wrote or
-     * deleted, and how many of each; and, when the hosted service could not
-     * be reached or did not answer, why (null otherwise), the whole batch
-     * being the writes to retry then.
+     * deleted, how many of each, and whether the hosted service turned any
+     * call away for the account's request rate; and, when the hosted service
+     * could not be reached or did not answer, why (null otherwise), the
+     * whole batch being the writes to retry then.
      */
-    record Written(Batch retry, Set<String> touched, int writes, int deletes, String unavailable) {}
+    record Written(Batch retry, Set<String> touched, int writes, int deletes, boolean rateLimited, String unavailable) {}
 
     /**
      * Write {@code b} to {@code table}: its deletes, then its rows in one
@@ -2170,14 +2246,20 @@ public class InfinoEngine extends InternalEngine {
      * from its source, or null when there are none (see {@link #notTaken}).
      *
      * <p>When the hosted service could not be reached or did not answer the
-     * lookup, the prepare or the append (the bridge marks the error
-     * {@link InfinoNative.InfinoException#unavailable}, whether its status is
-     * 502, 503 or 504), the whole batch is
-     * returned to retry rather than the failure thrown: the write's sync is
-     * acknowledged and the next commit writes the batch, looking each row up
-     * first since the service may have committed the append and only its
-     * answer was lost, so a retried row replaces the one already there
-     * rather than being added again.
+     * lookup, the delete, the prepare or the append (the bridge marks the
+     * error {@link InfinoNative.InfinoException#unavailable}, whether its
+     * status is 502, 503 or 504), or turned one away for the account's
+     * request rate (429), the whole batch is returned to retry rather than
+     * the failure thrown ({@link InfinoNative.InfinoException#retryStatus}):
+     * the write's sync is acknowledged and the next commit writes the batch,
+     * looking each row up first since the service may have committed the
+     * append and only its answer was lost, so a retried row replaces the one
+     * already there rather than being added again; turned away for the
+     * rate, the batch wrote nothing, so each write keeps the base it had. An
+     * append the service ended partway reports the documents it did not
+     * write one by one instead, as not taken ({@link #notTaken}), and only
+     * those are retried. Every write to retry carries the base the next
+     * commit starts from.
      */
     static Written write(
         String table,
@@ -2221,6 +2303,7 @@ public class InfinoEngine extends InternalEngine {
             }
         }
         Batch retry = new Batch();
+        boolean rateLimited = false;
         String unavailable = null;
         try {
             // An id this node has no record of may be a row another node wrote:
@@ -2236,7 +2319,7 @@ public class InfinoEngine extends InternalEngine {
             if (!deleted.isEmpty()) {
                 int rc = InfinoNative.deleteOsids(table, deleted.toArray(new String[0]), deleted.size());
                 if (rc != 0) {
-                    throw new IllegalStateException("[infino] delete of " + deleted.size() + " ids from " + table + " returned " + rc);
+                    throw InfinoNative.deleteFailed(table, deleted.size(), rc);
                 }
             }
             if (!ids.isEmpty()) {
@@ -2263,7 +2346,10 @@ public class InfinoEngine extends InternalEngine {
                 Pointer prepared = InfinoNative.prepare(table, ids, sources, routings, seqs, opSeqs, generation, ignored);
                 // The batch carries each row's sequence number from prepare, so the append names none.
                 InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced, null);
-                retry = notTaken(table, result.failed(), ids, written, withMapped);
+                retry = notTaken(table, result.failed(), ids, written, replaced, withMapped);
+                for (InfinoNative.PreparedFailure f : result.failed()) {
+                    rateLimited |= f.status() == RestStatus.TOO_MANY_REQUESTS;
+                }
                 // Every document it did not take was turned away for the moment (a 429 for the
                 // account's request rate, say): the service did not take the commit, as when it
                 // does not answer, so a replay waits it out rather than stopping.
@@ -2272,22 +2358,32 @@ public class InfinoEngine extends InternalEngine {
                 }
             }
         } catch (InfinoNative.InfinoException e) {
-            if (!e.unavailable()) {
+            if (e.retryStatus() == null) {
                 throw e;
             }
+            rateLimited = e.retryStatus() == RestStatus.TOO_MANY_REQUESTS;
             // The hosted service could not be reached or did not answer (a 502, 503
-            // or 504, or no answer at all: the bridge marks each alike). The whole
-            // batch is kept for the next commit, which looks each row up, since the
-            // service may have committed the append and only its answer was lost.
+            // or 504, or no answer at all: the bridge marks each alike), or turned a
+            // call away for the account's request rate (429). The whole batch is kept
+            // for the next commit, which looks each row up, since the service may
+            // have committed the append and only its answer was lost.
             // The write's sync is not failed for it (see commitBeforeSync): a
             // client that retried an auto-id bulk would get its documents twice.
+            // A call turned away for the rate wrote nothing, so each write keeps
+            // its base; one that was not answered may have landed, so each is
+            // looked up.
             log.warn("[infino] the hosted service did not take a commit of {} writes and {} deletes to {}; the next commit tries again: {}", ids.size(), deleted.size(), table, e.getMessage());
+            if (!rateLimited) {
+                for (Entry entry : b.entries.values()) {
+                    entry.base = Base.UNKNOWN;
+                }
+            }
             retry = b;
             unavailable = e.getMessage();
         }
         Set<String> touched = new HashSet<>(ids);
         touched.addAll(deleted);
-        return new Written(retry, touched, ids.size(), deleted.size(), unavailable);
+        return new Written(retry, touched, ids.size(), deleted.size(), rateLimited, unavailable);
     }
 
     /**
@@ -2304,21 +2400,38 @@ public class InfinoEngine extends InternalEngine {
      * next commit, and the table's
      * hold on the shard's history stays below it until a commit takes it
      * (see {@link #holdHistoryThrough}), so a new primary writes it too.
+     *
+     * <p>A document the write did not reach because the hosted service ended
+     * it carries a status ({@link InfinoNative.PreparedFailure#status}) and is
+     * not checked: the service refused nothing it carries. Turned away for
+     * the account's request rate (429), or refused for a column its batch was
+     * typed without ({@link InfinoNative.PreparedFailure#staleSchema}), it was
+     * not written, so the table holds under its id what this commit found
+     * ({@code replaced} names the ids that hold a row), and the next commit
+     * writes it without looking it up. Any other is looked up, since a call
+     * the service did not answer may have written it. The documents put back are logged in one line.
      */
     private static Batch notTaken(
         String table,
         List<InfinoNative.PreparedFailure> failed,
         List<String> ids,
         List<Version> written,
+        Set<String> replaced,
         BiFunction<String, Version, Version> withMapped
     ) {
         Batch retry = new Batch();
         boolean checkable = true;
+        // The documents put back for the next commit, logged once: how many, how
+        // many of them the service turned away for the rate, and one reason.
+        int again = 0;
+        int limited = 0;
+        String why = null;
         for (InfinoNative.PreparedFailure f : failed) {
             String id = ids.get(f.index());
             Version v = written.get(f.index());
             String refused = f.permanent() ? f.reason() : null;
-            if (refused == null && checkable) {
+            // A document turned away for the account's request rate carries a status: nothing to check.
+            if (refused == null && checkable && f.status() == null) {
                 try {
                     refused = InfinoNative.checkDoc(table, v.forTable(), v.ignored());
                 } catch (InfinoNative.InfinoException e) {
@@ -2337,8 +2450,9 @@ public class InfinoEngine extends InternalEngine {
                         continue;
                     }
                 } catch (InfinoNative.InfinoException e) {
-                    log.warn("[infino] table {} did not take document {} (operation {}); the next commit tries again: {}", table, id, v.seq(), e.getMessage());
                     retry.add(id, Base.UNKNOWN, v);
+                    again++;
+                    why = why == null ? e.getMessage() : why;
                     continue;
                 } catch (RuntimeException e) {
                     log.debug("[infino] the mapper refuses document {} of table {} on replay: {}", id, table, e.getMessage());
@@ -2354,8 +2468,23 @@ public class InfinoEngine extends InternalEngine {
                 );
                 continue;
             }
-            log.warn("[infino] table {} did not take document {} (operation {}); the next commit tries again: {}", table, id, v.seq(), f.reason());
-            retry.add(id, Base.UNKNOWN, v);
+            if (f.status() == RestStatus.TOO_MANY_REQUESTS || f.staleSchema()) {
+                retry.add(id, replaced.contains(id) ? Base.PRESENT : Base.ABSENT, v);
+                limited += f.staleSchema() ? 0 : 1;
+            } else {
+                retry.add(id, Base.UNKNOWN, v);
+            }
+            again++;
+            why = why == null ? f.reason() : why;
+        }
+        if (again > 0) {
+            log.warn(
+                "[infino] table {} did not take {} documents of a commit ({} turned away for the account's request rate); the next commit tries again: {}",
+                table,
+                again,
+                limited,
+                why
+            );
         }
         return retry;
     }
