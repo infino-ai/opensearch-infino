@@ -90,7 +90,7 @@
                 filters: { one: { term: { prio: 1 } } }
   - match: { aggregations.by_prio.buckets.one.doc_count: 1 }
   - match: { aggregations.by_prio.buckets._other_.doc_count: 1 }
-  # A terms aggregation's missing value is a bucket of its own; include/exclude is refused, never ignored.
+  # A terms aggregation's missing value is a bucket of its own; a partitioned include is refused, never ignored.
   - do:
       search:
         index: srt1
@@ -103,13 +103,13 @@
   - match: { aggregations.prios.buckets.0.doc_count: 1 }
   - match: { aggregations.prios.buckets.1.key: 1 }
   - do:
-      catch: /has\sinclude\/exclude/
+      catch: /partition/
       search:
         index: srt1
         body:
           size: 0
           aggs:
-            tags: { terms: { field: tag, include: [ x ] } }
+            tags: { terms: { field: tag, include: { partition: 0, num_partitions: 2 } } }
   - do:
       indices.delete:
         index: srt1,srt2
