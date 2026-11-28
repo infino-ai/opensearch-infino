@@ -2187,11 +2187,16 @@ teardown:
 
 ---
 "Discover's default requests answer as stock, in DQL and in Lucene mode":
+  - skip:
+      features: allowed_warnings
   # What Discover sends for a word typed in its search bar. In DQL the word is a
   # lenient best_fields multi_match in filter context beside the time range; in
   # Lucene mode a query_string in must with analyze_wildcard and the browser's
   # time_zone. Each comes with the hits sorted by time and the histogram.
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_luc
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "timeout", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2208,6 +2213,9 @@ teardown:
   - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:06:00.000Z" }
   - match: { aggregations.2.buckets.2.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_prx
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "timeout", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2224,6 +2232,9 @@ teardown:
   - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:06:00.000Z" }
   - match: { aggregations.2.buckets.2.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_def
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "timeout", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2240,6 +2251,9 @@ teardown:
   - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:06:00.000Z" }
   - match: { aggregations.2.buckets.2.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_luc
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "payments", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2259,6 +2273,9 @@ teardown:
   - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
   - match: { aggregations.2.buckets.3.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_prx
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "payments", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2278,6 +2295,9 @@ teardown:
   - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
   - match: { aggregations.2.buckets.3.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_def
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "payments", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2297,6 +2317,9 @@ teardown:
   - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
   - match: { aggregations.2.buckets.3.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_luc
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "504", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2307,6 +2330,9 @@ teardown:
   - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
   - match: { aggregations.2.buckets.0.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_prx
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "504", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2317,6 +2343,9 @@ teardown:
   - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
   - match: { aggregations.2.buckets.0.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_def
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "504", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2327,6 +2356,9 @@ teardown:
   - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
   - match: { aggregations.2.buckets.0.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_luc
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "timeout", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2343,6 +2375,9 @@ teardown:
   - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:06:00.000Z" }
   - match: { aggregations.2.buckets.2.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_prx
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "timeout", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2359,6 +2394,9 @@ teardown:
   - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:06:00.000Z" }
   - match: { aggregations.2.buckets.2.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_def
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "timeout", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2375,6 +2413,9 @@ teardown:
   - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:06:00.000Z" }
   - match: { aggregations.2.buckets.2.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_luc
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "payments", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2394,6 +2435,9 @@ teardown:
   - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
   - match: { aggregations.2.buckets.3.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_prx
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "payments", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2413,6 +2457,9 @@ teardown:
   - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
   - match: { aggregations.2.buckets.3.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_def
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "payments", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2432,6 +2479,9 @@ teardown:
   - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
   - match: { aggregations.2.buckets.3.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_luc
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "pay*", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2451,6 +2501,9 @@ teardown:
   - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
   - match: { aggregations.2.buckets.3.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_prx
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "pay*", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
@@ -2470,6 +2523,9 @@ teardown:
   - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
   - match: { aggregations.2.buckets.3.doc_count: 1 }
   - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
       search:
         index: dfs_def
         body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "pay*", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
