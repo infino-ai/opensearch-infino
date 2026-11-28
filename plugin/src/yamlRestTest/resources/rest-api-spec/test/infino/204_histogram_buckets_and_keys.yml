@@ -1,0 +1,198 @@
+# A histogram reads no more groups than search.max_buckets allows and
+# fails past it with stock's error; a script with no field keys by a
+# number, as stock reads a script's values; a value script keeps the date
+# field's format; and hard bounds give the same buckets as a condition on
+# the rows. Each request runs on a Lucene twin too, so the answers are
+# stock's.
+setup:
+  - do:
+      indices.create:
+        index: hb_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              t: { type: date }
+              f: { type: date, format: "yyyy/MM/dd HH:mm:ss||epoch_millis" }
+              p: { type: long }
+              ip: { type: keyword }
+  - do:
+      indices.create:
+        index: hb_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              t: { type: date }
+              f: { type: date, format: "yyyy/MM/dd HH:mm:ss||epoch_millis" }
+              p: { type: long }
+              ip: { type: keyword }
+  - do:
+      indices.create:
+        index: hb_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              t: { type: date }
+              f: { type: date, format: "yyyy/MM/dd HH:mm:ss||epoch_millis" }
+              p: { type: long }
+              ip: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: hb_luc
+        body:
+          - index: { _id: "1" }
+          - { "t": 1600000000000, "f": "2020/09/13 12:26:40", "p": 10, "ip": "a" }
+          - index: { _id: "2" }
+          - { "t": 1600000030000, "f": "2020/09/13 12:27:10", "p": 5, "ip": "b" }
+          - index: { _id: "3" }
+          - { "t": 1600000061000, "f": "2020/09/13 12:27:41", "p": 7, "ip": "a" }
+          - index: { _id: "4" }
+          - { "t": 1600010800005, "f": "2020/09/13 15:26:40", "p": 1, "ip": "c" }
+          - index: { _id: "5" }
+          - { "p": 3, "ip": "d" }
+  - do:
+      bulk:
+        refresh: true
+        index: hb_prx
+        body:
+          - index: { _id: "1" }
+          - { "t": 1600000000000, "f": "2020/09/13 12:26:40", "p": 10, "ip": "a" }
+          - index: { _id: "2" }
+          - { "t": 1600000030000, "f": "2020/09/13 12:27:10", "p": 5, "ip": "b" }
+          - index: { _id: "3" }
+          - { "t": 1600000061000, "f": "2020/09/13 12:27:41", "p": 7, "ip": "a" }
+          - index: { _id: "4" }
+          - { "t": 1600010800005, "f": "2020/09/13 15:26:40", "p": 1, "ip": "c" }
+          - index: { _id: "5" }
+          - { "p": 3, "ip": "d" }
+  - do:
+      bulk:
+        refresh: true
+        index: hb_def
+        body:
+          - index: { _id: "1" }
+          - { "t": 1600000000000, "f": "2020/09/13 12:26:40", "p": 10, "ip": "a" }
+          - index: { _id: "2" }
+          - { "t": 1600000030000, "f": "2020/09/13 12:27:10", "p": 5, "ip": "b" }
+          - index: { _id: "3" }
+          - { "t": 1600000061000, "f": "2020/09/13 12:27:41", "p": 7, "ip": "a" }
+          - index: { _id: "4" }
+          - { "t": 1600010800005, "f": "2020/09/13 15:26:40", "p": 1, "ip": "c" }
+          - index: { _id: "5" }
+          - { "p": 3, "ip": "d" }
+
+---
+teardown:
+  - do:
+      cluster.put_settings:
+        body:
+          transient:
+            search.max_buckets: null
+  - do:
+      indices.delete:
+        index: hb_luc,hb_prx,hb_def
+        ignore_unavailable: true
+
+---
+"A histogram past search.max_buckets fails with stock's error":
+  - do:
+      cluster.put_settings:
+        body:
+          transient:
+            search.max_buckets: 3
+  - do:
+      catch: /Trying to create too many buckets. Must be less than or equal to. \[3\] but was \[5\]/
+      search: { index: hb_luc, body: { size: 0, aggs: { h: { histogram: { field: p, interval: 1, min_doc_count: 1 } } } } }
+  - do:
+      catch: /Trying to create too many buckets. Must be less than or equal to. \[3\] but was \[4\]/
+      search: { index: hb_luc, body: { size: 0, aggs: { d: { date_histogram: { field: t, fixed_interval: 1ms, min_doc_count: 1 }, aggs: { s: { sum: { field: p } } } } } } }
+  - do:
+      search: { index: hb_luc, body: { size: 0, aggs: { h: { histogram: { field: p, interval: 5, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 3 }
+  - do:
+      catch: /Trying to create too many buckets. Must be less than or equal to. \[3\] but was \[5\]/
+      search: { index: hb_prx, body: { size: 0, aggs: { h: { histogram: { field: p, interval: 1, min_doc_count: 1 } } } } }
+  - do:
+      catch: /Trying to create too many buckets. Must be less than or equal to. \[3\] but was \[4\]/
+      search: { index: hb_prx, body: { size: 0, aggs: { d: { date_histogram: { field: t, fixed_interval: 1ms, min_doc_count: 1 }, aggs: { s: { sum: { field: p } } } } } } }
+  - do:
+      search: { index: hb_prx, body: { size: 0, aggs: { h: { histogram: { field: p, interval: 5, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 3 }
+  - do:
+      catch: /Trying to create too many buckets. Must be less than or equal to. \[3\] but was \[5\]/
+      search: { index: hb_def, body: { size: 0, aggs: { h: { histogram: { field: p, interval: 1, min_doc_count: 1 } } } } }
+  - do:
+      catch: /Trying to create too many buckets. Must be less than or equal to. \[3\] but was \[4\]/
+      search: { index: hb_def, body: { size: 0, aggs: { d: { date_histogram: { field: t, fixed_interval: 1ms, min_doc_count: 1 }, aggs: { s: { sum: { field: p } } } } } } }
+  - do:
+      search: { index: hb_def, body: { size: 0, aggs: { h: { histogram: { field: p, interval: 5, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 3 }
+
+---
+"A histogram over a script that returns a date keys by a number":
+  - do:
+      search: { index: hb_luc, body: { size: 0, query: { exists: { field: t } }, aggs: { h: { histogram: { script: "doc['t'].value", interval: 3600000, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 2 }
+  - match: { aggregations.h.buckets.0.key: 1599998400000.0 }
+  - match: { aggregations.h.buckets.0.doc_count: 3 }
+  - is_false: aggregations.h.buckets.0.key_as_string
+  - match: { aggregations.h.buckets.1.key: 1600009200000.0 }
+  - do:
+      search: { index: hb_prx, body: { size: 0, query: { exists: { field: t } }, aggs: { h: { histogram: { script: "doc['t'].value", interval: 3600000, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 2 }
+  - match: { aggregations.h.buckets.0.key: 1599998400000.0 }
+  - match: { aggregations.h.buckets.0.doc_count: 3 }
+  - is_false: aggregations.h.buckets.0.key_as_string
+  - match: { aggregations.h.buckets.1.key: 1600009200000.0 }
+  - do:
+      search: { index: hb_def, body: { size: 0, query: { exists: { field: t } }, aggs: { h: { histogram: { script: "doc['t'].value", interval: 3600000, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 2 }
+  - match: { aggregations.h.buckets.0.key: 1599998400000.0 }
+  - match: { aggregations.h.buckets.0.doc_count: 3 }
+  - is_false: aggregations.h.buckets.0.key_as_string
+  - match: { aggregations.h.buckets.1.key: 1600009200000.0 }
+
+---
+"A value script over a date field keeps the field's format":
+  - do:
+      search: { index: hb_luc, body: { size: 0, aggs: { h: { histogram: { field: f, script: "_value", interval: 3600000, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 2 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2020/09/13 12:00:00" }
+  - match: { aggregations.h.buckets.0.doc_count: 3 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2020/09/13 15:00:00" }
+  - do:
+      search: { index: hb_prx, body: { size: 0, aggs: { h: { histogram: { field: f, script: "_value", interval: 3600000, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 2 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2020/09/13 12:00:00" }
+  - match: { aggregations.h.buckets.0.doc_count: 3 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2020/09/13 15:00:00" }
+  - do:
+      search: { index: hb_def, body: { size: 0, aggs: { h: { histogram: { field: f, script: "_value", interval: 3600000, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 2 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2020/09/13 12:00:00" }
+  - match: { aggregations.h.buckets.0.doc_count: 3 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2020/09/13 15:00:00" }
+
+---
+"Hard bounds with an offset and a sub-aggregation keep only the buckets inside them":
+  - do:
+      search: { index: hb_luc, body: { size: 0, aggs: { h: { histogram: { field: p, interval: 5, offset: 1, min_doc_count: 1, hard_bounds: { min: 0, max: 4 } }, aggs: { c: { cardinality: { field: ip } } } } } } }
+  - length: { aggregations.h.buckets: 1 }
+  - match: { aggregations.h.buckets.0.key: 1.0 }
+  - match: { aggregations.h.buckets.0.doc_count: 3 }
+  - match: { aggregations.h.buckets.0.c.value: 3 }
+  - do:
+      search: { index: hb_prx, body: { size: 0, aggs: { h: { histogram: { field: p, interval: 5, offset: 1, min_doc_count: 1, hard_bounds: { min: 0, max: 4 } }, aggs: { c: { cardinality: { field: ip } } } } } } }
+  - length: { aggregations.h.buckets: 1 }
+  - match: { aggregations.h.buckets.0.key: 1.0 }
+  - match: { aggregations.h.buckets.0.doc_count: 3 }
+  - match: { aggregations.h.buckets.0.c.value: 3 }
+  - do:
+      search: { index: hb_def, body: { size: 0, aggs: { h: { histogram: { field: p, interval: 5, offset: 1, min_doc_count: 1, hard_bounds: { min: 0, max: 4 } }, aggs: { c: { cardinality: { field: ip } } } } } } }
+  - length: { aggregations.h.buckets: 1 }
+  - match: { aggregations.h.buckets.0.key: 1.0 }
+  - match: { aggregations.h.buckets.0.doc_count: 3 }
+  - match: { aggregations.h.buckets.0.c.value: 3 }
