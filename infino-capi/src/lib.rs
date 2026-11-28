@@ -6326,14 +6326,24 @@ fn get_row_latest(conn: &Bridge, name: &str, osid: &str) -> Result<Option<Row>, 
 /// latest commit when `latest`, for a node that may not have read the last
 /// commit another node made, else through `conn` itself. One open of the
 /// table serves every id, whose lookups run side by side
-/// ([`side_by_side`]). A lookup that fails is an error for the whole call,
-/// so a failed read is never taken for a missing document.
+/// ([`side_by_side`]); on a hosted connection the ids are read a statement
+/// at a time instead ([`hosted_rows`]). A lookup that fails is an error for
+/// the whole call, so a failed read is never taken for a missing document.
 fn rows_of(
     conn: &Bridge,
     name: &str,
     osids: &[&str],
     latest: bool,
 ) -> Result<Vec<(String, Row)>, InfinoError> {
+    if conn.hosted {
+        // A hosted service answers from every commit there is, so `latest`
+        // asks nothing more of it.
+        let mut found = hosted_rows(&conn.table(name)?, &conn.conn, name, osids)?;
+        return Ok(osids
+            .iter()
+            .filter_map(|id| found.remove(*id).map(|row| ((*id).to_owned(), row)))
+            .collect());
+    }
     if conn.is_attached(name) {
         // An attached table is read in one statement over its ids, as a page is.
         return Ok(attached_rows(conn, name, osids)
@@ -6412,55 +6422,66 @@ fn row_in(
     // source, the sequence number and, where the table has taken a routed
     // write, the routing. A table declared before the id column carried that
     // index refuses the lookup; it falls back to an equality on the column.
-    let routed = table.schema().field_with_name(ROUTING).is_ok();
-    let columns: &[&str] = if routed {
-        &[SOURCE, SEQ, ROUTING]
-    } else {
-        &[SOURCE, SEQ]
-    };
+    let columns = row_columns(table);
     let batches = match table.exact_match(OSID, osid, Some(columns)) {
         Ok(batches) => batches,
         Err(_) => sql.query_sql(&row_by_osid_sql(name, osid, columns))?,
     };
-    for b in &batches {
-        if b.num_rows() == 0 {
-            continue;
-        }
-        let Some(source) = b
-            .column_by_name(SOURCE)
-            .and_then(|c| c.as_any().downcast_ref::<LargeStringArray>())
-        else {
-            continue;
-        };
-        if source.is_null(0) {
-            continue;
-        }
-        let seq = b
-            .column_by_name(SEQ)
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-            .filter(|a| !a.is_null(0))
-            .map_or(0, |a| a.value(0));
-        let routing = b
-            .column_by_name(ROUTING)
-            .filter(|c| !c.is_null(0))
-            .and_then(|c| match c.data_type() {
-                DataType::LargeUtf8 => c
-                    .as_any()
-                    .downcast_ref::<LargeStringArray>()
-                    .map(|a| a.value(0).to_string()),
-                DataType::Utf8 => c
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .map(|a| a.value(0).to_string()),
-                _ => None,
-            });
-        return Ok(Some(Row {
-            source: source.value(0).to_string(),
-            seq,
-            routing,
-        }));
+    Ok(batches
+        .iter()
+        .filter(|b| b.num_rows() > 0)
+        .find_map(|b| row_at(b, 0)))
+}
+
+/// The columns a get reads of a row of `table` ([`Row`]): the source, the
+/// sequence number and, where the table has taken a routed write, the
+/// routing.
+fn row_columns(table: &Supertable) -> &'static [&'static str] {
+    if table.schema().field_with_name(ROUTING).is_ok() {
+        &[SOURCE, SEQ, ROUTING]
+    } else {
+        &[SOURCE, SEQ]
     }
-    Ok(None)
+}
+
+/// Row `r` of `b` as a get reads it ([`Row`]), from its [`SOURCE`], [`SEQ`]
+/// and [`ROUTING`] columns; None when the row has no source.
+fn row_at(b: &RecordBatch, r: usize) -> Option<Row> {
+    let source = b
+        .column_by_name(SOURCE)
+        .and_then(|c| string_at(c.as_ref(), r))?;
+    let seq = b
+        .column_by_name(SEQ)
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+        .filter(|a| !a.is_null(r))
+        .map_or(0, |a| a.value(r));
+    let routing = b
+        .column_by_name(ROUTING)
+        .and_then(|c| string_at(c.as_ref(), r));
+    Some(Row {
+        source,
+        seq,
+        routing,
+    })
+}
+
+/// The text of `column` at row `r`, for a `Utf8` or `LargeUtf8` column;
+/// None for a null, or a column of any other type.
+fn string_at(column: &dyn Array, r: usize) -> Option<String> {
+    if column.is_null(r) {
+        return None;
+    }
+    match column.data_type() {
+        DataType::LargeUtf8 => column
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .map(|a| a.value(r).to_string()),
+        DataType::Utf8 => column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|a| a.value(r).to_string()),
+        _ => None,
+    }
 }
 
 /// The statement [`row_in`] falls back to: `columns` of the row under
@@ -6473,6 +6494,64 @@ fn row_by_osid_sql(name: &str, osid: &str, columns: &[&str]) -> String {
         columns.join(", "),
         name.replace('"', "\"\""),
         osid.replace('\'', "''")
+    )
+}
+
+/// Most ids one statement of [`hosted_rows`] asks for. A sorted page of
+/// 500 hits, the size Dashboards Discover asks for, is read in one call,
+/// and a page of 1,000 in two.
+const HOSTED_ROWS_PER_STATEMENT: usize = 500;
+
+/// The rows of a hosted table under `osids`, each id to its [`Row`]; an id
+/// the table does not hold is absent. The ids are read in one statement for
+/// each [`HOSTED_ROWS_PER_STATEMENT`] of them ([`rows_by_osids_sql`]), one
+/// statement after another.
+///
+/// On a hosted connection every lookup by id is a request to the service,
+/// and the service limits how many requests an account makes a second. Read
+/// one id at a time, as [`row_in`] reads, a page of a few hundred hits made
+/// a few hundred requests at once, and the service refused it with 429. A
+/// statement over the ids reads the whole id column where a lookup reads
+/// one id's postings, but it does so on the service, in one request. An
+/// error when a read fails, so a failed read is never taken for a missing
+/// document.
+fn hosted_rows(
+    table: &Supertable,
+    sql: &Connection,
+    name: &str,
+    osids: &[&str],
+) -> Result<HashMap<String, Row>, InfinoError> {
+    let mut columns = vec![OSID];
+    columns.extend_from_slice(row_columns(table));
+    let mut found = HashMap::new();
+    for chunk in osids.chunks(HOSTED_ROWS_PER_STATEMENT) {
+        for b in &sql.query_sql(&rows_by_osids_sql(name, chunk, &columns))? {
+            let Some(ids) = b.column_by_name(OSID) else {
+                continue;
+            };
+            for r in 0..b.num_rows() {
+                if let (Some(id), Some(row)) = (string_at(ids.as_ref(), r), row_at(b, r)) {
+                    found.entry(id).or_insert(row);
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The statement [`hosted_rows`] reads a run of ids with: `columns` of the
+/// rows whose id is one of `osids`. Names and ids are quoted as
+/// [`row_by_osid_sql`] quotes them.
+fn rows_by_osids_sql(name: &str, osids: &[&str], columns: &[&str]) -> String {
+    let ids: Vec<String> = osids
+        .iter()
+        .map(|id| format!("'{}'", id.replace('\'', "''")))
+        .collect();
+    format!(
+        "SELECT {} FROM \"{}\" WHERE {OSID} IN ({})",
+        columns.join(", "),
+        name.replace('"', "\"\""),
+        ids.join(", ")
     )
 }
 
@@ -6544,7 +6623,9 @@ const GET_MANY_THREADS: usize = 16;
 /// column's index. A page of a sorted search reads its sources this way once
 /// its ids are chosen, and the lookups ran one call after another; here they
 /// run side by side, at most [`GET_MANY_THREADS`] at once, so a page costs
-/// about what its slowest lookup does.
+/// about what its slowest lookup does. On a hosted connection, where each
+/// lookup is a request the service counts against the account's rate, the
+/// ids are read a statement at a time instead ([`hosted_rows`]).
 #[no_mangle]
 pub unsafe extern "C" fn infino_get_many(
     h: *mut Bridge,
@@ -6561,6 +6642,19 @@ pub unsafe extern "C" fn infino_get_many(
             return match attached_rows(conn, name, &ids) {
                 Ok(found) => out_json(json!({ "sources": found })),
                 Err(e) => err_json(&format!("get_many: {e}")),
+            };
+        }
+        if conn.hosted {
+            return match rows_of(conn, name, &ids, false) {
+                Ok(rows) => {
+                    let found: serde_json::Map<String, Value> = rows
+                        .into_iter()
+                        .filter(|(_, row)| !row.source.is_empty())
+                        .map(|(id, row)| (id, Value::String(row.source)))
+                        .collect();
+                    out_json(json!({ "sources": found }))
+                }
+                Err(e) => read_err_json("get_many", name, &e),
             };
         }
         // A failure keeps the id apart from the engine's message, so the id
@@ -12372,6 +12466,210 @@ mod tests {
             "append: server returned 400: append error: schema: adding [x] exceeds 10; raise `max_fields` in the schema or fix the producer".into(),
         );
         assert_eq!(mismatched_column(&cap), None);
+    }
+
+    /// How many documents the table of [`fake_hosted_docs`] holds.
+    const FAKE_DOCS: usize = 1_200;
+    /// What the hosted service answers a request past the account's rate with.
+    const RATE_LIMITED: &str = r#"{"error":"rate limit exceeded"}"#;
+
+    /// The string literals of a SQL statement, in order, `''` read as `'`.
+    fn quoted(sql: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut chars = sql.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '\'' {
+                continue;
+            }
+            let mut literal = String::new();
+            loop {
+                match chars.next() {
+                    Some('\'') if chars.peek() == Some(&'\'') => {
+                        chars.next();
+                        literal.push('\'');
+                    }
+                    Some('\'') | None => break,
+                    Some(c) => literal.push(c),
+                }
+            }
+            out.push(literal);
+        }
+        out
+    }
+
+    /// The source a document of [`fake_hosted_docs`] holds under [`fake_id`] `i`.
+    fn fake_source(i: usize) -> String {
+        json!({ "n": i }).to_string()
+    }
+
+    /// A fake hosted service on a local port serving one table of
+    /// [`FAKE_DOCS`] documents, [`fake_id`] `i` holding [`fake_source`] `i`
+    /// under sequence number `i`. It answers an `exact_match` with the row of
+    /// the id it names, and a `query_sql` with the rows of every id the
+    /// statement quotes, so a lookup one id at a time and a statement over
+    /// many ids both find the documents; or, when `refuse`, both with 429 as
+    /// the service answers past an account's rate. Returns a bridge open on
+    /// it, the table's handle already read, and the calls taken after that.
+    fn fake_hosted_docs(refuse: bool) -> (*mut Bridge, Calls) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(OSID, DataType::Utf8, true),
+            Field::new(SOURCE, DataType::LargeUtf8, true),
+            Field::new(SEQ, DataType::Int64, true),
+        ]));
+        let written = Arc::clone(&schema);
+        let ipc_of = move |batch: Option<RecordBatch>| {
+            let mut ipc = Vec::new();
+            let mut w = StreamWriter::try_new(&mut ipc, &written).unwrap();
+            if let Some(batch) = batch {
+                w.write(&batch).unwrap();
+            }
+            w.finish().unwrap();
+            drop(w);
+            ipc
+        };
+        let rows_of = move |ids: &[String]| {
+            let held: Vec<usize> = ids
+                .iter()
+                .filter_map(|id| id.strip_prefix("doc-")?.parse().ok())
+                .filter(|&i: &usize| i < FAKE_DOCS)
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from_iter_values(
+                        held.iter().map(|&i| fake_id(i)),
+                    )),
+                    Arc::new(LargeStringArray::from_iter_values(
+                        held.iter().map(|&i| fake_source(i)),
+                    )),
+                    Arc::new(Int64Array::from_iter_values(held.iter().map(|&i| i as i64))),
+                ],
+            )
+            .unwrap();
+            ipc_of(Some(batch))
+        };
+        let empty = rows_of(&[]);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/db", listener.local_addr().unwrap());
+        let calls: Calls = Arc::default();
+        let log = Arc::clone(&calls);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let Some((target, body)) = read_request_and_body(&mut stream) else {
+                    continue;
+                };
+                let op = target
+                    .trim_start_matches("/v1/")
+                    .split('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                log.lock().unwrap().push((op.clone(), target.len()));
+                let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let (status, body) = match op.as_str() {
+                    "list_tables" => (200, json!([FAKE_TABLE]).to_string().into_bytes()),
+                    "schema" => (200, empty.clone()),
+                    "exact_match" | "query_sql" if refuse => {
+                        (STATUS_TOO_MANY_REQUESTS, RATE_LIMITED.as_bytes().to_vec())
+                    }
+                    "exact_match" => {
+                        let id = request["value"].as_str().unwrap_or("").to_string();
+                        (200, rows_of(&[id]))
+                    }
+                    "query_sql" => (
+                        200,
+                        rows_of(&quoted(request["query"].as_str().unwrap_or(""))),
+                    ),
+                    _ => (STATUS_NOT_FOUND, Vec::new()),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream
+                    .write_all(head.as_bytes())
+                    .and_then(|()| stream.write_all(&body));
+            }
+        });
+        let h = unsafe { infino_open_with(c(&uri).as_ptr(), c(FAKE_KEY).as_ptr(), ptr::null()) };
+        assert!(!h.is_null());
+        bridge_ref(h).unwrap().table(FAKE_TABLE).unwrap();
+        calls.lock().unwrap().clear();
+        (h, calls)
+    }
+
+    /// `call` (`infino_get_many` or one of its kind) over `ids` of the
+    /// table of [`fake_hosted_docs`], its answer parsed.
+    fn by_ids(
+        h: *mut Bridge,
+        call: unsafe extern "C" fn(
+            *mut Bridge,
+            *const c_char,
+            *const *const c_char,
+            c_int,
+        ) -> *mut c_char,
+        ids: &[String],
+    ) -> Value {
+        let held: Vec<CString> = ids.iter().map(|x| c(x)).collect();
+        let idp: Vec<*const c_char> = held.iter().map(|x| x.as_ptr()).collect();
+        let out =
+            take(unsafe { call(h, c(FAKE_TABLE).as_ptr(), idp.as_ptr(), idp.len() as c_int) });
+        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+    }
+
+    /// On a hosted account a page's sources, and a multi-get's documents
+    /// (as of the latest commit or not), are read in one statement for each [`HOSTED_ROWS_PER_STATEMENT`] ids,
+    /// not one request an id: the service limits how many requests an
+    /// account makes a second, and refused a page of a few hundred hits read
+    /// one id at a time. Every document comes back whole, and an id the
+    /// table does not hold is absent.
+    #[test]
+    fn a_hosted_page_is_read_in_one_request_for_each_few_hundred_ids() {
+        let (h, calls) = fake_hosted_docs(false);
+        let page = 1_000;
+        let mut ids: Vec<String> = (0..page).map(fake_id).collect();
+        ids.push("no-such-id".to_string());
+        ids.push("it's".to_string());
+        let statements = ids.len().div_ceil(HOSTED_ROWS_PER_STATEMENT);
+
+        let v = by_ids(h, infino_get_many, &ids);
+        let sources = v["sources"].as_object().unwrap_or_else(|| panic!("{v}"));
+        assert_eq!(sources.len(), page, "every held id, and only those");
+        for i in 0..page {
+            assert_eq!(sources[&fake_id(i)], fake_source(i));
+        }
+        assert_eq!(ops(&calls), vec!["query_sql"; statements]);
+
+        for call in [infino_get_docs, infino_get_docs_latest] {
+            calls.lock().unwrap().clear();
+            let v = by_ids(h, call, &ids);
+            let docs = v["docs"].as_object().unwrap_or_else(|| panic!("{v}"));
+            assert_eq!(docs.len(), page, "every held id, and only those");
+            for i in [0, 499, 500, page - 1] {
+                assert_eq!(docs[&fake_id(i)]["source"], fake_source(i));
+                assert_eq!(docs[&fake_id(i)]["seq"], i);
+            }
+            assert_eq!(ops(&calls), vec!["query_sql"; statements]);
+        }
+        close(h);
+    }
+
+    /// A hosted read of a page the service refuses is an error for the
+    /// whole call, with the service's status, never a page missing its
+    /// documents.
+    #[test]
+    fn a_refused_hosted_page_read_is_an_error_with_the_service_s_status() {
+        let (h, _) = fake_hosted_docs(true);
+        let ids: Vec<String> = (0..3).map(fake_id).collect();
+        for call in [infino_get_many, infino_get_docs, infino_get_docs_latest] {
+            let v = by_ids(h, call, &ids);
+            assert!(v.get("sources").is_none() && v.get("docs").is_none(), "{v}");
+            assert_eq!(v["status"], STATUS_TOO_MANY_REQUESTS, "{v}");
+        }
+        close(h);
     }
 
     /// A whole write (a replace, a delete, a schema change) waits for the

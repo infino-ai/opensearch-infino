@@ -2001,8 +2001,11 @@ public final class InfinoNative {
      * The sources of these ids, by id, each looked up through the id
      * column's index: a page's worth costs what its ids do, whatever the
      * table holds, where one statement over the ids would read the whole id
-     * column. An id the table does not hold is absent; a lookup that fails
-     * throws, so a failed read is never taken for a deleted document.
+     * column. On a hosted account, where each lookup is a request the service
+     * counts against the account's rate, the bridge reads the ids in one
+     * statement for each few hundred of them instead. An id the table does
+     * not hold is absent; a lookup that fails throws, so a failed read is
+     * never taken for a deleted document.
      */
     public static Map<String, String> sources(String name, Collection<String> osids) {
         Map<String, String> out = new HashMap<>();

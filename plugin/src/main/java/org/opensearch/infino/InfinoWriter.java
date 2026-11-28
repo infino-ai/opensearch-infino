@@ -48,6 +48,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -669,6 +670,38 @@ public final class InfinoWriter {
     }
 
     /**
+     * The documents the updates among {@code writes} merge into: each update's
+     * id the table holds ({@code existed}) to its source, read by {@code read}
+     * in one call for them all, and null for an id the read no longer finds.
+     * An update whose id is not here reads its base on its own. One call for
+     * the batch rather than one an update: on a hosted account each call is a
+     * request the service counts against the account's rate, and a bulk of a
+     * thousand updates read one at a time was refused with 429.
+     */
+    static Map<String, String> updateBases(
+        Collection<Write> writes,
+        Set<String> existed,
+        Function<Set<String>, Map<String, InfinoNative.Doc>> read
+    ) {
+        Set<String> ids = new HashSet<>();
+        for (Write w : writes) {
+            if (w.update() != null && existed.contains(w.id())) {
+                ids.add(w.id());
+            }
+        }
+        Map<String, String> bases = new HashMap<>();
+        if (ids.isEmpty()) {
+            return bases;
+        }
+        Map<String, InfinoNative.Doc> docs = read.apply(ids);
+        for (String id : ids) {
+            InfinoNative.Doc doc = docs.get(id);
+            bases.put(id, doc == null ? null : doc.source());
+        }
+        return bases;
+    }
+
+    /**
      * Write the batch: the rows of ids the table already holds replace
      * those rows in the same mutation as the append (so a failed write
      * leaves the old rows), ids whose last write is a delete are tombstoned
@@ -701,6 +734,8 @@ public final class InfinoWriter {
         }
         Set<String> existed;
         Map<String, Long> stored;
+        // The document each update's id stands at in the table, read for all the batch's updates at once.
+        Map<String, String> bases;
         boolean latest;
         long latestSet;
         try {
@@ -736,6 +771,16 @@ public final class InfinoWriter {
                 stored = Map.of();
                 existed = latest ? InfinoNative.existingOsidsLatest(table, lookups) : InfinoNative.existingOsids(table, lookups);
             }
+            List<Write> writes = new ArrayList<>();
+            for (Staged s : staged) {
+                for (Outcome o : s.waiter().outcomes()) {
+                    if (o.write() != null) {
+                        writes.add(o.write());
+                    }
+                }
+            }
+            final boolean readLatest = latest;
+            bases = updateBases(writes, existed, ids -> InfinoNative.docsOf(table, ids, readLatest));
         } catch (RuntimeException e) {
             // The handles never reached the engine: released here, once.
             for (Staged s : staged) {
@@ -785,6 +830,7 @@ public final class InfinoWriter {
                             // append writes its id.
                             try {
                                 String base = documents.containsKey(w.id()) ? documents.get(w.id()) : current == null ? null
+                                    : bases.containsKey(w.id()) ? bases.get(w.id())
                                     : latest ? InfinoNative.getSourceLatest(table, w.id())
                                     : InfinoNative.getSourceFresh(table, w.id());
                                 String document = null;
