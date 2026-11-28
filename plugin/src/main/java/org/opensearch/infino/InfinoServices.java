@@ -219,13 +219,27 @@ public final class InfinoServices extends AbstractLifecycleComponent {
      * {@code failure}, which stays the one reported.
      */
     static void drain(CompletableFuture<?> started, Throwable failure) {
+        Throwable own = settle(started);
+        if (own != null) {
+            failure.addSuppressed(own);
+        }
+    }
+
+    /**
+     * Waits for {@code started}, if any, to finish, for a caller that no
+     * longer needs its result: the work is not left running past the request
+     * that started it. Its failure is returned, not thrown; null when it
+     * succeeded or nothing was started.
+     */
+    static Throwable settle(CompletableFuture<?> started) {
         if (started == null) {
-            return;
+            return null;
         }
         try {
             started.join();
+            return null;
         } catch (CompletionException | CancellationException e) {
-            failure.addSuppressed(e.getCause() != null ? e.getCause() : e);
+            return e.getCause() != null ? e.getCause() : e;
         }
     }
 

@@ -8,11 +8,14 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.MultiMatchQueryBuilder;
 import org.opensearch.index.query.Operator;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.QueryShardException;
 import org.opensearch.index.query.QueryStringQueryBuilder;
+import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
+import org.opensearch.search.internal.SearchContext;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.time.Instant;
@@ -1104,6 +1107,86 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         return InfinoQueryTranslator.textCountStatement(TABLE, t.where(), 10001);
     }
 
+    /** A count's cap when the request names no track_total_hits limit: one past the default limit. */
+    private static final long DEFAULT_CAP = SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO + 1;
+
+    /** A page's size, larger than none. */
+    private static final int PAGE_SIZE = 10;
+
+    /** A time range big5's query string searches within. */
+    private static RangeQueryBuilder timeRange() {
+        return QueryBuilders.rangeQuery("@timestamp").gte("2023-01-03T00:00:00Z").lt("2023-01-03T10:00:00Z");
+    }
+
+    /** big5's query string: one word on message, the others on every text column. */
+    private static final String BIG5_QUERY_STRING = "message: monkey jackal bear";
+
+    /** A query string beside a time range, in filter context: an unscored text OR. */
+    private static Translation filteredTextOr() {
+        return translateWithTitle(
+            QueryBuilders.boolQuery().filter(timeRange()).filter(QueryBuilders.queryStringQuery(BIG5_QUERY_STRING))
+        );
+    }
+
+    private static Map<String, Column> columnsWithTitle() {
+        Map<String, Column> cols = columns();
+        cols.put("title", new Column("title", "str", true, false));
+        return cols;
+    }
+
+    private static InfinoSearch.Plan planWithTitle(Translation t) {
+        return planWithTitle(t, null);
+    }
+
+    /** A plan over {@code t} with {@code postFilter}, if any, as its post_filter. */
+    private static InfinoSearch.Plan planWithTitle(Translation t, QueryBuilder postFilter) {
+        Map<String, Column> cols = columnsWithTitle();
+        String postWhere = postFilter == null ? null : InfinoQueryTranslator.predicate(postFilter, cols, TABLE, NOW);
+        return new InfinoSearch.Plan(TABLE, cols, t, List.of(), null, postWhere, null, null, List.of(), InfinoAccess.NONE, NOW);
+    }
+
+    /**
+     * A capped total counted from the token index runs beside the page even
+     * where a short page would be the total: it costs little and stops at
+     * its cap. Uncapped, or any other count, waits for the page as before.
+     */
+    public void testATokenIndexCountRunsBesideThePage() {
+        InfinoSearch.Plan plan = planWithTitle(filteredTextOr());
+        assertTrue(InfinoSearch.shortPageIsTotal(plan));
+        assertTrue(InfinoSearch.countsTokenIndex(plan.query(), DEFAULT_CAP));
+        assertTrue(InfinoSearch.countsBeside(plan, true, true, PAGE_SIZE, false, DEFAULT_CAP));
+        assertFalse(InfinoSearch.countsBeside(plan, true, true, PAGE_SIZE, false, Long.MAX_VALUE));
+        assertFalse(InfinoSearch.countsBeside(plan, true, true, 0, false, DEFAULT_CAP));
+        InfinoSearch.Plan filtered = plan(translate(QueryBuilders.termQuery("level", "error")));
+        assertFalse(InfinoSearch.countsBeside(filtered, true, true, PAGE_SIZE, false, DEFAULT_CAP));
+        // big5's own request: the query string a must, ranked across its text
+        // columns. Its total is the same capped count, beside the ranked page.
+        Translation must = translateWithTitle(
+            QueryBuilders.boolQuery().must(timeRange()).must(QueryBuilders.queryStringQuery(BIG5_QUERY_STRING))
+        );
+        assertNotNull(must.scoring().across());
+        assertTrue(InfinoSearch.countsBeside(planWithTitle(must), true, true, PAGE_SIZE, false, DEFAULT_CAP));
+    }
+
+    /**
+     * Whether a short page's total counts beside it is judged on what the
+     * total counts, the query and the post_filter together. A text clause in
+     * both is no longer one OR of text clauses, so the count would be the
+     * capped scan, not the token index: it waits for the page, which may be
+     * its own total. A post_filter of filters alone keeps the token index count.
+     */
+    public void testATokenIndexCountBesideThePageIsJudgedWithThePostFilter() {
+        InfinoSearch.Plan bothText = planWithTitle(filteredTextOr(), QueryBuilders.matchQuery("title", "bear"));
+        assertTrue(InfinoSearch.shortPageIsTotal(bothText));
+        // The query alone would be counted from the token index; with its post_filter it is not.
+        assertTrue(InfinoSearch.countsTokenIndex(bothText.query(), DEFAULT_CAP));
+        assertFalse(InfinoSearch.countsTokenIndex(InfinoSearch.totalQuery(bothText), DEFAULT_CAP));
+        assertFalse(InfinoSearch.countsBeside(bothText, true, true, PAGE_SIZE, false, DEFAULT_CAP));
+        InfinoSearch.Plan filterOnly = planWithTitle(filteredTextOr(), QueryBuilders.termQuery("level", "error"));
+        assertTrue(InfinoSearch.countsTokenIndex(InfinoSearch.totalQuery(filterOnly), DEFAULT_CAP));
+        assertTrue(InfinoSearch.countsBeside(filterOnly, true, true, PAGE_SIZE, false, DEFAULT_CAP));
+    }
+
     public void testTextUnderShouldIsARowPredicate() {
         BoolQueryBuilder b = QueryBuilders.boolQuery()
             .should(QueryBuilders.matchQuery("message", "disk"))
@@ -1994,13 +2077,13 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
      */
     public void testAPageCountsBesideOnlyWhenAShortPageCannotBeItsTotal() {
         InfinoSearch.Plan filtered = plan(translate(QueryBuilders.termQuery("level", "error")));
-        assertFalse(InfinoSearch.countsBeside(filtered, true, true, 10, false));
+        assertFalse(InfinoSearch.countsBeside(filtered, true, true, 10, false, Long.MAX_VALUE));
         InfinoSearch.Plan ranked = plan(translate(QueryBuilders.matchQuery("message", "disk")));
-        assertTrue(InfinoSearch.countsBeside(ranked, true, true, 10, false));
-        assertFalse(InfinoSearch.countsBeside(ranked, true, true, 10, true));
-        assertFalse(InfinoSearch.countsBeside(ranked, false, true, 10, false));
-        assertFalse(InfinoSearch.countsBeside(ranked, true, false, 10, false));
-        assertFalse(InfinoSearch.countsBeside(ranked, true, true, 0, false));
+        assertTrue(InfinoSearch.countsBeside(ranked, true, true, 10, false, Long.MAX_VALUE));
+        assertFalse(InfinoSearch.countsBeside(ranked, true, true, 10, true, Long.MAX_VALUE));
+        assertFalse(InfinoSearch.countsBeside(ranked, false, true, 10, false, Long.MAX_VALUE));
+        assertFalse(InfinoSearch.countsBeside(ranked, true, false, 10, false, Long.MAX_VALUE));
+        assertFalse(InfinoSearch.countsBeside(ranked, true, true, 0, false, Long.MAX_VALUE));
     }
 
     // ---- nested ----
