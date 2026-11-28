@@ -101,7 +101,7 @@ setup:
 teardown:
   - do:
       indices.delete:
-        index: tz_luc,tz_prx,tz_def
+        index: tz_luc,tz_prx,tz_def,tzb_luc,tzb_prx,tzb_def
         ignore_unavailable: true
 
 ---
@@ -495,3 +495,246 @@ teardown:
                 after: { date: "2017-11-04T23:00" }
                 sources:
                   - date: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York } }
+
+---
+# What a dashboard sends: a time_zone with extended_bounds in epoch milliseconds, which say
+# where the request's dates fall. The bounds span New York's change of 2026-11-01 (06:00Z,
+# clocks back an hour), so the dates on each side that are clear of it are floored in UTC with
+# that side's offset, and the ones within a day after it are read through the zone. Dates sit
+# just before and at local midnight on both sides, and every twenty minutes through the hour
+# that happens twice.
+"A zoned histogram with bounds across a clock change":
+  - do:
+      indices.create:
+        index: tzb_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { d: { type: date } } }
+  - do:
+      indices.create:
+        index: tzb_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { d: { type: date } } }
+  - do:
+      indices.create:
+        index: tzb_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { d: { type: date } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: tzb_luc, _id: "1" }
+          - { "d": "2026-10-30T03:59:59Z" }
+          - index: { _index: tzb_luc, _id: "2" }
+          - { "d": "2026-10-30T04:00:00Z" }
+          - index: { _index: tzb_luc, _id: "3" }
+          - { "d": "2026-10-30T15:30:00Z" }
+          - index: { _index: tzb_luc, _id: "4" }
+          - { "d": "2026-10-31T03:10:00Z" }
+          - index: { _index: tzb_luc, _id: "5" }
+          - { "d": "2026-10-31T12:00:00Z" }
+          - index: { _index: tzb_luc, _id: "6" }
+          - { "d": "2026-10-31T20:45:00Z" }
+          - index: { _index: tzb_luc, _id: "7" }
+          - { "d": "2026-11-01T05:00:00Z" }
+          - index: { _index: tzb_luc, _id: "8" }
+          - { "d": "2026-11-01T05:20:00Z" }
+          - index: { _index: tzb_luc, _id: "9" }
+          - { "d": "2026-11-01T05:40:00Z" }
+          - index: { _index: tzb_luc, _id: "10" }
+          - { "d": "2026-11-01T06:00:00Z" }
+          - index: { _index: tzb_luc, _id: "11" }
+          - { "d": "2026-11-01T06:20:00Z" }
+          - index: { _index: tzb_luc, _id: "12" }
+          - { "d": "2026-11-01T06:40:00Z" }
+          - index: { _index: tzb_luc, _id: "13" }
+          - { "d": "2026-11-01T07:00:00Z" }
+          - index: { _index: tzb_luc, _id: "14" }
+          - { "d": "2026-11-01T18:00:00Z" }
+          - index: { _index: tzb_luc, _id: "15" }
+          - { "d": "2026-11-02T04:59:59Z" }
+          - index: { _index: tzb_luc, _id: "16" }
+          - { "d": "2026-11-02T05:00:00Z" }
+          - index: { _index: tzb_luc, _id: "17" }
+          - { "d": "2026-11-02T09:15:00Z" }
+          - index: { _index: tzb_luc, _id: "18" }
+          - { "d": "2026-11-03T04:59:59Z" }
+          - index: { _index: tzb_luc, _id: "19" }
+          - { "d": "2026-11-03T05:00:00Z" }
+          - index: { _index: tzb_luc, _id: "20" }
+          - { "d": "2026-11-03T16:20:00Z" }
+          - index: { _index: tzb_luc, _id: "21" }
+          - { "d": "2026-11-04T04:30:00Z" }
+          - index: { _index: tzb_prx, _id: "1" }
+          - { "d": "2026-10-30T03:59:59Z" }
+          - index: { _index: tzb_prx, _id: "2" }
+          - { "d": "2026-10-30T04:00:00Z" }
+          - index: { _index: tzb_prx, _id: "3" }
+          - { "d": "2026-10-30T15:30:00Z" }
+          - index: { _index: tzb_prx, _id: "4" }
+          - { "d": "2026-10-31T03:10:00Z" }
+          - index: { _index: tzb_prx, _id: "5" }
+          - { "d": "2026-10-31T12:00:00Z" }
+          - index: { _index: tzb_prx, _id: "6" }
+          - { "d": "2026-10-31T20:45:00Z" }
+          - index: { _index: tzb_prx, _id: "7" }
+          - { "d": "2026-11-01T05:00:00Z" }
+          - index: { _index: tzb_prx, _id: "8" }
+          - { "d": "2026-11-01T05:20:00Z" }
+          - index: { _index: tzb_prx, _id: "9" }
+          - { "d": "2026-11-01T05:40:00Z" }
+          - index: { _index: tzb_prx, _id: "10" }
+          - { "d": "2026-11-01T06:00:00Z" }
+          - index: { _index: tzb_prx, _id: "11" }
+          - { "d": "2026-11-01T06:20:00Z" }
+          - index: { _index: tzb_prx, _id: "12" }
+          - { "d": "2026-11-01T06:40:00Z" }
+          - index: { _index: tzb_prx, _id: "13" }
+          - { "d": "2026-11-01T07:00:00Z" }
+          - index: { _index: tzb_prx, _id: "14" }
+          - { "d": "2026-11-01T18:00:00Z" }
+          - index: { _index: tzb_prx, _id: "15" }
+          - { "d": "2026-11-02T04:59:59Z" }
+          - index: { _index: tzb_prx, _id: "16" }
+          - { "d": "2026-11-02T05:00:00Z" }
+          - index: { _index: tzb_prx, _id: "17" }
+          - { "d": "2026-11-02T09:15:00Z" }
+          - index: { _index: tzb_prx, _id: "18" }
+          - { "d": "2026-11-03T04:59:59Z" }
+          - index: { _index: tzb_prx, _id: "19" }
+          - { "d": "2026-11-03T05:00:00Z" }
+          - index: { _index: tzb_prx, _id: "20" }
+          - { "d": "2026-11-03T16:20:00Z" }
+          - index: { _index: tzb_prx, _id: "21" }
+          - { "d": "2026-11-04T04:30:00Z" }
+          - index: { _index: tzb_def, _id: "1" }
+          - { "d": "2026-10-30T03:59:59Z" }
+          - index: { _index: tzb_def, _id: "2" }
+          - { "d": "2026-10-30T04:00:00Z" }
+          - index: { _index: tzb_def, _id: "3" }
+          - { "d": "2026-10-30T15:30:00Z" }
+          - index: { _index: tzb_def, _id: "4" }
+          - { "d": "2026-10-31T03:10:00Z" }
+          - index: { _index: tzb_def, _id: "5" }
+          - { "d": "2026-10-31T12:00:00Z" }
+          - index: { _index: tzb_def, _id: "6" }
+          - { "d": "2026-10-31T20:45:00Z" }
+          - index: { _index: tzb_def, _id: "7" }
+          - { "d": "2026-11-01T05:00:00Z" }
+          - index: { _index: tzb_def, _id: "8" }
+          - { "d": "2026-11-01T05:20:00Z" }
+          - index: { _index: tzb_def, _id: "9" }
+          - { "d": "2026-11-01T05:40:00Z" }
+          - index: { _index: tzb_def, _id: "10" }
+          - { "d": "2026-11-01T06:00:00Z" }
+          - index: { _index: tzb_def, _id: "11" }
+          - { "d": "2026-11-01T06:20:00Z" }
+          - index: { _index: tzb_def, _id: "12" }
+          - { "d": "2026-11-01T06:40:00Z" }
+          - index: { _index: tzb_def, _id: "13" }
+          - { "d": "2026-11-01T07:00:00Z" }
+          - index: { _index: tzb_def, _id: "14" }
+          - { "d": "2026-11-01T18:00:00Z" }
+          - index: { _index: tzb_def, _id: "15" }
+          - { "d": "2026-11-02T04:59:59Z" }
+          - index: { _index: tzb_def, _id: "16" }
+          - { "d": "2026-11-02T05:00:00Z" }
+          - index: { _index: tzb_def, _id: "17" }
+          - { "d": "2026-11-02T09:15:00Z" }
+          - index: { _index: tzb_def, _id: "18" }
+          - { "d": "2026-11-03T04:59:59Z" }
+          - index: { _index: tzb_def, _id: "19" }
+          - { "d": "2026-11-03T05:00:00Z" }
+          - index: { _index: tzb_def, _id: "20" }
+          - { "d": "2026-11-03T16:20:00Z" }
+          - index: { _index: tzb_def, _id: "21" }
+          - { "d": "2026-11-04T04:30:00Z" }
+
+  # The bounds: 2026-10-30T04:00:00Z (local midnight) to 2026-11-04T04:59:59.999Z.
+  - do:
+      search:
+        index: tzb_luc
+        body:
+          size: 0
+          aggs:
+            hour: { date_histogram: { field: d, fixed_interval: 1h, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } } }
+            day: { date_histogram: { field: d, calendar_interval: day, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } } }
+            hour_max: { date_histogram: { field: d, fixed_interval: 1h, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
+            day_max: { date_histogram: { field: d, calendar_interval: day, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
+            cal_hour_max: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
+            shifted_max: { date_histogram: { field: d, fixed_interval: 3h, offset: "+30m", time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
+  # An hour: the last of the 29th and the first of the 30th, in daylight time and floored.
+  - length: { aggregations.hour.buckets: 122 }
+  - match: { aggregations.hour.buckets.0: { key_as_string: "2026-10-29T23:00:00.000-04:00", key: 1793329200000, doc_count: 1 } }
+  - match: { aggregations.hour.buckets.1: { key_as_string: "2026-10-30T00:00:00.000-04:00", key: 1793332800000, doc_count: 1 } }
+  # 01:00 to 02:00 happens twice on the 1st, and starts a bucket each time.
+  - match: { aggregations.hour.buckets.50: { key_as_string: "2026-11-01T01:00:00.000-04:00", key: 1793509200000, doc_count: 3 } }
+  - match: { aggregations.hour.buckets.51: { key_as_string: "2026-11-01T01:00:00.000-05:00", key: 1793512800000, doc_count: 3 } }
+  - match: { aggregations.hour.buckets.52: { key_as_string: "2026-11-01T02:00:00.000-05:00", key: 1793516400000, doc_count: 1 } }
+  # Within a day after the change, through the zone; later, in standard time and floored.
+  - match: { aggregations.hour.buckets.73: { key_as_string: "2026-11-01T23:00:00.000-05:00", key: 1793592000000, doc_count: 1 } }
+  - match: { aggregations.hour.buckets.74: { key_as_string: "2026-11-02T00:00:00.000-05:00", key: 1793595600000, doc_count: 1 } }
+  - match: { aggregations.hour.buckets.97: { key_as_string: "2026-11-02T23:00:00.000-05:00", key: 1793678400000, doc_count: 1 } }
+  - match: { aggregations.hour.buckets.98: { key_as_string: "2026-11-03T00:00:00.000-05:00", key: 1793682000000, doc_count: 1 } }
+  - match: { aggregations.hour.buckets.121: { key_as_string: "2026-11-03T23:00:00.000-05:00", key: 1793764800000, doc_count: 1 } }
+  # A day: the 1st is 25 hours long and starts at its daylight-time midnight.
+  - length: { aggregations.day.buckets: 6 }
+  - match: { aggregations.day.buckets.0: { key_as_string: "2026-10-29T00:00:00.000-04:00", key: 1793246400000, doc_count: 1 } }
+  - match: { aggregations.day.buckets.1: { key_as_string: "2026-10-30T00:00:00.000-04:00", key: 1793332800000, doc_count: 3 } }
+  - match: { aggregations.day.buckets.2: { key_as_string: "2026-10-31T00:00:00.000-04:00", key: 1793419200000, doc_count: 2 } }
+  - match: { aggregations.day.buckets.3: { key_as_string: "2026-11-01T00:00:00.000-04:00", key: 1793505600000, doc_count: 9 } }
+  - match: { aggregations.day.buckets.4: { key_as_string: "2026-11-02T00:00:00.000-05:00", key: 1793595600000, doc_count: 3 } }
+  - match: { aggregations.day.buckets.5: { key_as_string: "2026-11-03T00:00:00.000-05:00", key: 1793682000000, doc_count: 3 } }
+  # The same buckets with a metric in each, as a dashboard's chart of a sum has: a histogram of
+  # counts alone is counted from the column's index, and one with a metric is grouped by its key.
+  - length: { aggregations.hour_max.buckets: 122 }
+  - match: { aggregations.hour_max.buckets.1.key: 1793332800000 }
+  - match: { aggregations.hour_max.buckets.1.doc_count: 1 }
+  - match: { aggregations.hour_max.buckets.50.key: 1793509200000 }
+  - match: { aggregations.hour_max.buckets.50.doc_count: 3 }
+  - match: { aggregations.hour_max.buckets.50.last.value_as_string: "2026-11-01T05:40:00.000Z" }
+  - match: { aggregations.hour_max.buckets.51.key: 1793512800000 }
+  - match: { aggregations.hour_max.buckets.51.doc_count: 3 }
+  - match: { aggregations.hour_max.buckets.51.last.value_as_string: "2026-11-01T06:40:00.000Z" }
+  - match: { aggregations.hour_max.buckets.98.key: 1793682000000 }
+  - match: { aggregations.hour_max.buckets.98.doc_count: 1 }
+  - match: { aggregations.hour_max.buckets.121.key: 1793764800000 }
+  - length: { aggregations.day_max.buckets: 6 }
+  - match: { aggregations.day_max.buckets.1.key: 1793332800000 }
+  - match: { aggregations.day_max.buckets.1.doc_count: 3 }
+  - match: { aggregations.day_max.buckets.3.key: 1793505600000 }
+  - match: { aggregations.day_max.buckets.3.doc_count: 9 }
+  - match: { aggregations.day_max.buckets.3.last.value_as_string: "2026-11-02T04:59:59.000Z" }
+  - match: { aggregations.day_max.buckets.4.key: 1793595600000 }
+  - match: { aggregations.day_max.buckets.5.key: 1793682000000 }
+  - match: { aggregations.day_max.buckets.5.doc_count: 3 }
+  - set: { aggregations: stock }
+  - do:
+      search:
+        index: tzb_prx
+        body:
+          size: 0
+          aggs:
+            hour: { date_histogram: { field: d, fixed_interval: 1h, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } } }
+            day: { date_histogram: { field: d, calendar_interval: day, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } } }
+            hour_max: { date_histogram: { field: d, fixed_interval: 1h, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
+            day_max: { date_histogram: { field: d, calendar_interval: day, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
+            cal_hour_max: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
+            shifted_max: { date_histogram: { field: d, fixed_interval: 3h, offset: "+30m", time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
+  - match: { aggregations: $stock }
+  - do:
+      search:
+        index: tzb_def
+        body:
+          size: 0
+          aggs:
+            hour: { date_histogram: { field: d, fixed_interval: 1h, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } } }
+            day: { date_histogram: { field: d, calendar_interval: day, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } } }
+            hour_max: { date_histogram: { field: d, fixed_interval: 1h, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
+            day_max: { date_histogram: { field: d, calendar_interval: day, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
+            cal_hour_max: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
+            shifted_max: { date_histogram: { field: d, fixed_interval: 3h, offset: "+30m", time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
+  - match: { aggregations: $stock }

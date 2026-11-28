@@ -1827,7 +1827,7 @@ public class InfinoAggregationProcessor {
             }
             ZoneId tz = dh.timeZone() == null ? ZoneOffset.UTC : dh.timeZone();
             // Bounds in epoch milliseconds (what dashboards send) say where the request's dates fall.
-            LongBounds span = dh.hardBounds() != null ? dh.hardBounds() : dh.extendedBounds();
+            LongBounds span = dh.extendedBounds();
             DateExpr expr = dateExpr(
                 dh.getName(),
                 c,
